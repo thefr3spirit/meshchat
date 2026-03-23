@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Primary teal palette -->
+    <color name="colorPrimary">#00897B</color>
+    <color name="colorPrimaryDark">#00695C</color>
+    <color name="colorPrimaryLight">#4DB6AC</color>
+    <color name="colorAccent">#FF6D00</color>
+
+    <!-- Chat bubbles -->
+    <color name="bubbleSent">#00897B</color>
+    <color name="bubbleReceived">#ECEFF1</color>
+    <color name="bubbleSentText">#FFFFFF</color>
+    <color name="bubbleReceivedText">#212121</color>
+
+    <!-- Status indicators -->
+    <color name="statusOnline">#43A047</color>
+    <color name="statusOffline">#B0BEC5</color>
+    <color name="statusScanning">#FF6D00</color>
+    <color name="statusActive">#1E88E5</color>
+    <color name="statusIdle">#FFA726</color>
+
+    <!-- Backgrounds -->
+    <color name="chatBackground">#F5F5F5</color>
+    <color name="headerBackground">#00897B</color>
+    <color name="inputBarBackground">#FFFFFF</color>
+    <color name="inputFieldBackground">#F0F0F0</color>
+    <color name="cardBackground">#FFFFFF</color>
+    <color name="surfaceBackground">#FAFAFA</color>
+
+    <!-- Peer list -->
+    <color name="peerItemBackground">#FFFFFF</color>
+    <color name="peerConnected">#43A047</color>
+    <color name="peerAvailable">#FF6D00</color>
+
+    <!-- Diagnostics -->
+    <color name="diagCpu">#5C6BC0</color>
+    <color name="diagRam">#26A69A</color>
+    <color name="diagStorage">#FF7043</color>
+    <color name="diagBattery">#66BB6A</color>
+    <color name="diagDisplay">#AB47BC</color>
+    <color name="diagSensor">#42A5F5</color>
+    <color name="diagBluetooth">#29B6F6</color>
+    <color name="diagWifi">#26C6DA</color>
+    <color name="diagDevice">#78909C</color>
+</resources>

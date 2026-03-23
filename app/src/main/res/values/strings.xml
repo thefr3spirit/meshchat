@@ -1,0 +1,78 @@
+<resources>
+    <string name="app_name">MeshChat</string>
+    <string name="welcome_title">Welcome to MeshChat</string>
+    <string name="welcome_subtitle">Infrastructure-free messaging</string>
+    <string name="username_hint">Choose a username</string>
+    <string name="username_helper">This is how others will see you in the mesh</string>
+    <string name="join_mesh">Join the Mesh</string>
+    <string name="message_hint">Type a message\u2026</string>
+    <string name="scan">Scan</string>
+    <string name="send">Send</string>
+    <string name="visible">Visible</string>
+    <string name="hidden">Hidden</string>
+    <string name="scanning_devices">Scanning for nearby devices\u2026</string>
+    <string name="no_devices_found">No MeshChat devices found nearby</string>
+    <string name="nearby_devices">Nearby Devices</string>
+    <string name="connecting_to">Connecting to %1$s\u2026</string>
+    <string name="connected_to">Connected to %1$s</string>
+    <string name="disconnected_from">Disconnected from %1$s</string>
+    <string name="connection_failed">Connection to %1$s failed</string>
+    <string name="mesh_status">Mesh: %1$d node(s)</string>
+    <string name="mesh_status_queued">Mesh: %1$d node(s) \u00b7 %2$d queued</string>
+    <string name="queue_flushed">%1$d queued message(s) delivered!</string>
+    <string name="permissions_required">Permissions required for mesh networking</string>
+    <string name="visibility_on">You are now visible to nearby devices</string>
+    <string name="visibility_off">You are now hidden from nearby devices</string>
+    <string name="no_peers">No peers connected \u2014 message queued for delivery</string>
+    <string name="bluetooth_disabled">Bluetooth is disabled. Enable it for better mesh coverage.</string>
+    <string name="wifi_disabled">WiFi Direct unavailable on this device</string>
+    <string name="username_empty">Please enter a username</string>
+    <string name="username_too_short">Username must be at least 2 characters</string>
+    <string name="close">Close</string>
+
+    <!-- Bottom navigation -->
+    <string name="nav_chat">Chat</string>
+    <string name="nav_network">Network</string>
+    <string name="nav_settings">Settings</string>
+
+    <!-- Lecture 1: Hardware Diagnostics -->
+    <string name="hardware_diagnostics">Hardware Diagnostics</string>
+    <string name="hw_cpu">Processor (CPU)</string>
+    <string name="hw_ram">Memory (RAM)</string>
+    <string name="hw_storage">Storage</string>
+    <string name="hw_battery">Battery</string>
+    <string name="hw_display">Display</string>
+    <string name="hw_sensors">Sensors</string>
+    <string name="hw_bluetooth">Bluetooth</string>
+    <string name="hw_wifi">WiFi</string>
+    <string name="hw_device">Device Info</string>
+    <string name="settings_profile">Profile</string>
+    <string name="settings_username_current">Current username: %1$s</string>
+    <string name="change_username">Change Username</string>
+    <string name="username_updated">Username updated to %1$s</string>
+    <string name="about_app">About</string>
+    <string name="about_description">MeshChat v1.0\nInfrastructure-free mesh messenger\nBluetooth + WiFi Direct</string>
+
+    <!-- Lecture 2: Connectivity Manager -->
+    <string name="network_state">Network State</string>
+    <string name="state_idle">Idle</string>
+    <string name="state_connected">Connected</string>
+    <string name="state_active">Active</string>
+    <string name="state_disconnected">Disconnected</string>
+    <string name="transport_info">Transport</string>
+    <string name="mesh_network_status">Mesh Network</string>
+    <string name="event_log">Event Log</string>
+    <string name="event_log_subtitle">BroadcastReceiver events</string>
+    <string name="no_events_yet">No events recorded yet</string>
+    <string name="airplane_mode_on">\u2708 Airplane Mode ON</string>
+    <string name="airplane_mode_off">\u2708 Airplane Mode OFF</string>
+    <string name="bluetooth_turned_on">Bluetooth turned ON</string>
+    <string name="bluetooth_turned_off">Bluetooth turned OFF</string>
+    <string name="bluetooth_turning_on">Bluetooth turning on\u2026</string>
+    <string name="bluetooth_turning_off">Bluetooth turning off\u2026</string>
+    <string name="wifi_turned_on">WiFi turned ON</string>
+    <string name="wifi_turned_off">WiFi turned OFF</string>
+    <string name="network_available">Network available</string>
+    <string name="network_lost">Network lost</string>
+    <string name="network_capabilities_changed">Network capabilities changed</string>
+</resources>
