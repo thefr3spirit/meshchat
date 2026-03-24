@@ -11,11 +11,6 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
-import android.net.NetworkInfo;
-import android.net.wifi.p2p.WifiP2pConfig;
-import android.net.wifi.p2p.WifiP2pDevice;
-import android.net.wifi.p2p.WifiP2pInfo;
-import android.net.wifi.p2p.WifiP2pManager;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
@@ -26,9 +21,6 @@ import androidx.core.content.ContextCompat;
 import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
-import java.net.InetAddress;
-import java.net.ServerSocket;
-import java.net.Socket;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
@@ -43,531 +35,420 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
 /**
- * ============================================================================
- * MeshManager - The Heart of MeshChat's Peer-to-Peer Network
- * ============================================================================
+ * MeshManager — Bluetooth-only mesh networking engine.
  *
- * This class manages all mesh networking operations. Think of it as a
- * "traffic controller" that handles:
+ * Responsibilities:
+ *  1. PEER DISCOVERY    — Scans for Bluetooth devices advertising our network name
+ *  2. CONNECTIONS       — RFCOMM connections to nearby peers
+ *  3. MESSAGE ROUTING   — Broadcast and private (addressed) message routing
+ *  4. ENCRYPTION        — AES-256-GCM via CryptoManager
+ *  5. OFFLINE QUEUING   — Per-recipient queues, flushed on reconnect
+ *  6. IDENTITY          — Handshake protocol to exchange usernames and UUIDs
+ *  7. DISTANCE CONTROL  — RSSI threshold determines whether to auto-connect
  *
- *  1. PEER DISCOVERY   → Finding nearby devices (WiFi Direct + Bluetooth)
- *  2. CONNECTIONS       → Establishing and maintaining links to peers
- *  3. MESSAGE ROUTING   → Sending, receiving, and forwarding messages
- *  4. ENCRYPTION        → Securing messages with AES-256-GCM encryption
- *  5. OFFLINE QUEUING   → Storing messages when no peers are connected
+ * NETWORK NAMING:
+ * ──────────────
+ * Each mesh network has a human-readable name. Devices in the same network
+ * advertise a Bluetooth device name of "MC_<networkName>". This lets devices
+ * find each other during scanning by matching the prefix.
  *
- * ═══════════════════════════════════════════════════════════════════════
- * HOW MESH NETWORKING WORKS (for beginners):
- * ═══════════════════════════════════════════════════════════════════════
+ * PRIVATE MESSAGING ROUTING:
+ * ──────────────────────────
+ * Messages have an optional recipientId (UUID). If set:
+ *   - If recipient is directly connected → send directly to that socket
+ *   - If not → flood to all peers (they route it forward toward the recipient)
+ *   - On receive: if I'm the recipient → show in UI + send ACK
+ *                 if not me → forward only, don't show in UI
  *
- * Imagine you're in a basement or disaster zone with NO cell service.
- * Your phone can still use Bluetooth (~10m range) and WiFi Direct (~60m)
- * to talk directly to nearby phones WITHOUT a cell tower or WiFi router.
- *
- * Each phone becomes a "node" in the mesh network. When you send a message:
- *
- *   Step 1: Your phone sends the message to all directly connected phones
- *   Step 2: Those phones forward it to THEIR connected phones
- *   Step 3: This continues until the message has "hopped" 10 times (MAX_HOPS)
- *
- * Example — 3 phones in a chain:
- *   ┌─────────┐    Bluetooth    ┌─────────┐    WiFi Direct    ┌─────────┐
- *   │ Phone A │ ──────────────> │ Phone B │ ─────────────────> │ Phone C │
- *   │  (You)  │                 │ (Relay) │                    │ (Friend)│
- *   └─────────┘                 └─────────┘                    └─────────┘
- *      hop 0                       hop 1                          hop 2
- *
- *   Phone A sends → Phone B receives & forwards → Phone C receives.
- *   Even though A can't directly reach C, the message arrives!
- *
- * DUAL TRANSPORT:
+ * RSSI THRESHOLD:
  * ───────────────
- * We use BOTH Bluetooth AND WiFi Direct simultaneously:
- *
- *  • BLUETOOTH: Short range (~10m), low power, great for close proximity.
- *    Uses RFCOMM sockets (like a serial port over wireless).
- *    Devices identified by MAC address (e.g., "AA:BB:CC:DD:EE:FF").
- *
- *  • WIFI DIRECT: Longer range (~60m), higher bandwidth.
- *    Devices connect peer-to-peer WITHOUT needing a WiFi router.
- *    One device becomes "Group Owner" (acts like a temporary access point).
- *
- * MESSAGE DEDUPLICATION:
- * ─────────────────────
- * In a mesh, the same message might arrive through multiple paths:
- *
- *              ┌─── Phone B ───┐
- *   Phone A ──>│               │──> Phone D (receives message TWICE!)
- *              └─── Phone C ───┘
- *
- * We solve this by tracking message IDs in an LRU cache. Each message has
- * a unique UUID. If we've already seen that UUID, we ignore the duplicate.
- *
- * ============================================================================
+ * When a BT device is discovered, its RSSI is compared to rssiThreshold.
+ * Devices above the threshold are auto-connected (direct link).
+ * Devices below it are tracked but not auto-connected (rely on relay nodes).
+ * Users can adjust this threshold in Settings.
  */
-public class MeshManager implements WifiP2pManager.ConnectionInfoListener {
+public class MeshManager {
+
     private static final String TAG = "MeshManager";
 
-    // ─── Constants ──────────────────────────────────────────────────────
+    // ─── BT Service Identity ────────────────────────────────────────────
 
-    /** Unique identifier for the MeshChat Bluetooth service.
-     *  All MeshChat devices use this same UUID to find each other. */
-    private static final UUID MY_UUID = UUID.fromString("fa87c0d0-afac-11de-8a39-0800200c9a66");
+    /** RFCOMM service UUID — all MeshChat devices use this to find each other */
+    private static final UUID MY_UUID =
+            UUID.fromString("fa87c0d0-afac-11de-8a39-0800200c9a66");
 
-    /** Human-readable service name shown during Bluetooth discovery */
     private static final String SERVICE_NAME = "MeshChat";
 
-    /** TCP port for WiFi Direct communication (both server and client use this) */
-    private static final int WIFI_PORT = 8888;
+    // ─── Network name format ────────────────────────────────────────────
 
-    /**
-     * Maximum number of message IDs to remember for deduplication.
-     * Uses an LRU (Least Recently Used) cache so old IDs are automatically
-     * evicted, preventing unbounded memory growth over long sessions.
-     * 10,000 messages ≈ 400KB of memory (just UUID strings).
-     */
-    private static final int MAX_CACHED_MESSAGE_IDS = 10000;
+    /** BT device name prefix for all MeshChat nodes */
+    private static final String BT_PREFIX = "MC_";
 
-    /** How often (in seconds) to automatically scan for new mesh peers */
-    private static final int DISCOVERY_INTERVAL_SECONDS = 30;
+    /** Maximum length for Bluetooth device names */
+    private static final int BT_NAME_MAX = 30;
 
-    /** Default encryption passphrase — all mesh devices must share this */
+    // ─── SharedPreferences keys ─────────────────────────────────────────
+
+    private static final String PREFS_NAME = RegistrationActivity.PREFS_NAME;
+    private static final String KEY_NODE_ID = "node_id";
+    private static final String KEY_NETWORK_NAME = "current_network_name";
+    public static final String KEY_RSSI_THRESHOLD = "rssi_threshold";
+    public static final int DEFAULT_RSSI_THRESHOLD = -80;
+
+    // ─── Limits ─────────────────────────────────────────────────────────
+
+    private static final int MAX_CACHED_MSG_IDS = 10_000;
+    private static final int DISCOVERY_INTERVAL_SEC = 30;
     private static final String DEFAULT_PASSPHRASE = "MeshChat";
 
-    // ─── Core Components ────────────────────────────────────────────────
+    // ─── Core state ─────────────────────────────────────────────────────
 
-    /** Android application context for accessing system services */
     private final Context context;
-
-    /** WiFi P2P (WiFi Direct) system service manager */
-    private WifiP2pManager wifiP2pManager;
-
-    /** Communication channel with the WiFi P2P framework */
-    private WifiP2pManager.Channel channel;
-
-    /** System Bluetooth adapter for managing BT connections */
-    private BluetoothAdapter bluetoothAdapter;
-
-    /** Handles AES-256 encryption/decryption of message content */
+    private final SharedPreferences prefs;
     private final CryptoManager cryptoManager;
 
-    // ─── Connection Tracking ────────────────────────────────────────────
-    // We use ConcurrentHashMap-based collections because multiple threads
-    // (Bluetooth thread, WiFi thread, main thread) access these simultaneously.
-    // ConcurrentHashMap is thread-safe — it won't crash or corrupt data when
-    // multiple threads read/write at the same time.
+    /** This device's persistent UUID (generated once on install) */
+    private final String myNodeId;
 
-    /** Set of currently connected node IDs (MAC addresses or IP addresses) */
-    private final Set<String> connectedNodes = ConcurrentHashMap.newKeySet();
+    /** User's display name */
+    private String username;
+
+    /** Name of the mesh network we've joined (null = not in any network) */
+    private volatile String currentNetworkName;
 
     /**
-     * LRU (Least Recently Used) cache of processed message IDs.
-     *
-     * Thread-safe via Collections.synchronizedMap + synchronizedSet wrappers.
-     * When the cache exceeds MAX_CACHED_MESSAGE_IDS, the oldest entries
-     * are automatically removed, preventing memory from growing forever.
-     *
-     * WHY LRU? In a long-running mesh session, you might process thousands
-     * of messages. Without a limit, the set would consume ever more memory.
-     * LRU keeps only the most recent IDs — old messages won't be re-received.
+     * RSSI threshold in dBm. Devices with signal >= this value are
+     * auto-connected. Devices below it are relayed through other nodes.
      */
+    private int rssiThreshold;
+
+    // ─── Bluetooth ──────────────────────────────────────────────────────
+
+    private BluetoothAdapter bluetoothAdapter;
+    private BluetoothServerThread bluetoothServerThread;
+
+    // ─── Connection tracking ────────────────────────────────────────────
+
+    /** BT MAC addresses of currently connected peers */
+    private final Set<String> connectedNodes = ConcurrentHashMap.newKeySet();
+
+    /** Output streams keyed by peer's BT MAC address */
+    private final Map<String, ObjectOutputStream> bluetoothOutputStreams =
+            new ConcurrentHashMap<>();
+
+    /** Active Bluetooth sockets keyed by BT MAC address */
+    private final Map<String, BluetoothSocket> bluetoothSockets =
+            new ConcurrentHashMap<>();
+
+    // ─── Node identity mapping ──────────────────────────────────────────
+
+    /** UUID → BT MAC: used to find the socket for a private message recipient */
+    private final Map<String, String> nodeIdToAddress = new ConcurrentHashMap<>();
+
+    /** BT MAC → UUID: used to learn a peer's UUID from their socket address */
+    private final Map<String, String> addressToNodeId = new ConcurrentHashMap<>();
+
+    /** UUID → display name: populated during handshake */
+    private final Map<String, String> nodeNames = new ConcurrentHashMap<>();
+
+    /** BT MAC → last known RSSI (dBm) */
+    private final Map<String, Integer> rssiValues = new ConcurrentHashMap<>();
+
+    // ─── Discovery ──────────────────────────────────────────────────────
+
+    /** Recently discovered peers (for the peers list UI) */
+    private final Map<String, PeerAdapter.PeerInfo> discoveredPeers =
+            new ConcurrentHashMap<>();
+
+    /** Unique network names found during scanning, keyed by name */
+    private final Map<String, Network> discoveredNetworks = new ConcurrentHashMap<>();
+
+    // ─── Message deduplication (LRU) ────────────────────────────────────
+
     private final Set<String> processedMessages = Collections.newSetFromMap(
             Collections.synchronizedMap(
-                    new LinkedHashMap<String, Boolean>(MAX_CACHED_MESSAGE_IDS + 1, 0.75f, true) {
+                    new LinkedHashMap<String, Boolean>(MAX_CACHED_MSG_IDS + 1, 0.75f, true) {
                         @Override
                         protected boolean removeEldestEntry(Map.Entry<String, Boolean> eldest) {
-                            return size() > MAX_CACHED_MESSAGE_IDS;
+                            return size() > MAX_CACHED_MSG_IDS;
                         }
                     }
             )
     );
 
-    // ─── Stream Management ──────────────────────────────────────────────
-    // ObjectOutputStream is used to send serialized Message objects over the network.
-    // We keep persistent streams open for each connection to avoid the overhead
-    // of creating new streams (and re-sending the stream header) for every message.
-    //
-    // IMPORTANT: ObjectOutputStream writes a "stream header" when created.
-    // The corresponding ObjectInputStream expects to read that header exactly once.
-    // Creating a new ObjectOutputStream per message would cause the reader to
-    // see unexpected duplicate headers → StreamCorruptedException!
+    // ─── Offline queues ─────────────────────────────────────────────────
 
-    /** Output streams for Bluetooth connections, keyed by device MAC address */
-    private final Map<String, ObjectOutputStream> bluetoothOutputStreams = new ConcurrentHashMap<>();
+    /** Queue for broadcast messages when no peers are connected */
+    private final ConcurrentLinkedQueue<Message> broadcastOfflineQueue =
+            new ConcurrentLinkedQueue<>();
 
-    /** Output streams for WiFi connections, keyed by IP address */
-    private final Map<String, ObjectOutputStream> wifiOutputStreams = new ConcurrentHashMap<>();
+    /** Per-recipient queues for private messages when recipient isn't reachable */
+    private final Map<String, ConcurrentLinkedQueue<Message>> perRecipientQueue =
+            new ConcurrentHashMap<>();
 
-    /** Active Bluetooth socket connections, keyed by device MAC address */
-    private final Map<String, BluetoothSocket> bluetoothSockets = new ConcurrentHashMap<>();
+    // ─── Visibility ─────────────────────────────────────────────────────
 
-    /** Active WiFi socket connections, keyed by IP address */
-    private final Map<String, Socket> wifiSockets = new ConcurrentHashMap<>();
-
-    // ─── Discovered Peers (for the scan UI) ─────────────────────────────
-    /** Discovered Bluetooth devices that have "MeshChat" in their name */
-    private final Map<String, PeerAdapter.PeerInfo> discoveredPeers = new ConcurrentHashMap<>();
-
-    // ─── Visibility Control ─────────────────────────────────────────────
-    /** Whether this device is visible (discoverable) to other mesh nodes */
     private volatile boolean visible = true;
 
-    // ─── Username ───────────────────────────────────────────────────────
-    /** User-chosen display name, used in messages and BT advertising */
-    private String username;
+    // ─── Callbacks & threading ──────────────────────────────────────────
 
-    // ─── Offline Message Queue ──────────────────────────────────────────
-    /**
-     * Queue for messages that couldn't be sent because no peers were connected.
-     *
-     * USE CASE: You type messages while alone in a dead zone. When you walk
-     * into range of another MeshChat device, all queued messages are
-     * automatically delivered — no manual resend needed!
-     *
-     * ConcurrentLinkedQueue is thread-safe and non-blocking, meaning:
-     * - The UI thread can add messages without waiting
-     * - The network thread can drain messages without blocking the UI
-     */
-    private final ConcurrentLinkedQueue<Message> offlineMessageQueue = new ConcurrentLinkedQueue<>();
-
-    // ─── Callbacks and Threading ────────────────────────────────────────
-
-    /** Listener that receives callbacks for messages, connections, etc. */
     private MessageListener messageListener;
-
-    /**
-     * Handler for posting callbacks to the main (UI) thread.
-     * Android requires all UI updates to happen on the main thread.
-     * If you try to update a TextView from a background thread, the app crashes.
-     */
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
-
-    /** Reference to the WiFi server thread for cleanup */
-    private WifiServerThread wifiServerThread;
-
-    /** Reference to the Bluetooth server thread for cleanup */
-    private BluetoothServerThread bluetoothServerThread;
-
-    /**
-     * Scheduler for periodic peer discovery.
-     * Runs startDiscovery() every DISCOVERY_INTERVAL_SECONDS so we
-     * continuously find new devices joining the mesh.
-     */
     private ScheduledExecutorService discoveryScheduler;
 
     // ═══════════════════════════════════════════════════════════════════
     // CALLBACK INTERFACE
     // ═══════════════════════════════════════════════════════════════════
 
-    /**
-     * Interface for receiving mesh network events.
-     *
-     * The Activity or Service implements this to react when:
-     * - A new message arrives from another device
-     * - A new device connects or disconnects
-     * - Queued offline messages are delivered
-     */
     public interface MessageListener {
-        /** Called when a message is received from another device in the mesh */
+        /** A user chat message arrived (broadcast or private addressed to us) */
         void onMessageReceived(Message message);
 
-        /** Called when a new device joins the mesh network */
-        void onNodeConnected(String nodeId);
+        /** Connected node list changed — use to refresh Peers and Topology screens */
+        void onNodeInfoUpdated(List<NodeInfo> nodes);
 
-        /** Called when a device leaves the mesh network */
-        void onNodeDisconnected(String nodeId);
+        /** Scan found new mesh networks — use to refresh Network Discovery screen */
+        void onNetworkDiscovered(List<Network> networks);
 
-        /** Called when offline queued messages are flushed to a newly connected peer */
+        /** Offline queue was flushed after a new connection */
         void onQueueFlushed(int messageCount);
 
-        /** Called when a new peer is discovered during scanning */
-        void onPeerDiscovered(List<PeerAdapter.PeerInfo> peers);
+        /** ACK received: a private message was delivered to the recipient */
+        void onDeliveryStatusChanged(String messageId);
 
-        /** Called when scan completes and no new devices were found */
-        void onScanComplete(int peerCount);
+        /** We successfully joined or created a network */
+        void onNetworkJoined(String networkName);
+
+        /** We left the current network */
+        void onNetworkLeft();
     }
 
     // ═══════════════════════════════════════════════════════════════════
     // INITIALIZATION
     // ═══════════════════════════════════════════════════════════════════
 
-    /**
-     * Creates a new MeshManager and initializes all networking components.
-     *
-     * @param context The Android context (usually the MeshService)
-     */
     public MeshManager(Context context) {
         this.context = context;
-        // Load username from SharedPreferences
-        SharedPreferences prefs = context.getSharedPreferences(
-                RegistrationActivity.PREFS_NAME, Context.MODE_PRIVATE);
+        this.prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+
+        // Load or generate persistent node UUID
+        String storedId = prefs.getString(KEY_NODE_ID, null);
+        if (storedId == null) {
+            storedId = UUID.randomUUID().toString();
+            prefs.edit().putString(KEY_NODE_ID, storedId).apply();
+        }
+        this.myNodeId = storedId;
+
         this.username = prefs.getString(RegistrationActivity.KEY_USERNAME, Build.MODEL);
-        // Initialize encryption with the default mesh passphrase
+        this.currentNetworkName = prefs.getString(KEY_NETWORK_NAME, null);
+        this.rssiThreshold = prefs.getInt(KEY_RSSI_THRESHOLD, DEFAULT_RSSI_THRESHOLD);
         this.cryptoManager = new CryptoManager(DEFAULT_PASSPHRASE);
+
         initialize();
     }
 
-    /**
-     * Sets up WiFi Direct, Bluetooth, broadcast receivers, and periodic discovery.
-     * Called once during construction.
-     */
     private void initialize() {
-        // ── Step 1: Initialize WiFi Direct ──
-        // WiFi P2P (Peer-to-Peer) allows devices to connect WITHOUT a WiFi router
-        wifiP2pManager = (WifiP2pManager) context.getSystemService(Context.WIFI_P2P_SERVICE);
-        if (wifiP2pManager != null) {
-            // Create a "channel" — our communication link with the WiFi P2P framework
-            channel = wifiP2pManager.initialize(context, Looper.getMainLooper(), null);
-            if (channel != null) {
-                // Start listening for incoming WiFi Direct connections
-                wifiServerThread = new WifiServerThread();
-                wifiServerThread.start();
-            }
-        }
-
-        // ── Step 2: Initialize Bluetooth ──
-        // Returns null if the device has no Bluetooth hardware
         bluetoothAdapter = BluetoothAdapter.getDefaultAdapter();
         if (bluetoothAdapter != null) {
             setupBluetooth();
         }
-
-        // ── Step 3: Register broadcast receivers ──
-        // Listen for system events like "new device found"
         registerReceivers();
-
-        // ── Step 4: Start periodic discovery ──
-        // Automatically scan for new devices every DISCOVERY_INTERVAL_SECONDS
         startPeriodicDiscovery();
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // PERMISSION HELPERS
-    // ═══════════════════════════════════════════════════════════════════
+    // ─── Bluetooth setup ────────────────────────────────────────────────
 
-    /**
-     * Checks if a specific Android runtime permission has been granted.
-     * Android 6.0+ requires apps to ask the user for "dangerous" permissions.
-     *
-     * @param permission The permission string (e.g., Manifest.permission.BLUETOOTH_CONNECT)
-     * @return true if granted, false otherwise
-     */
-    private boolean hasPermission(String permission) {
-        return ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED;
-    }
-
-    // ═══════════════════════════════════════════════════════════════════
-    // BLUETOOTH SETUP
-    // ═══════════════════════════════════════════════════════════════════
-
-    /**
-     * Configures the Bluetooth adapter for mesh networking.
-     * Sets our device name to "MeshChat_<model>" so other MeshChat devices
-     * can recognize us during discovery (e.g., "MeshChat_Pixel 8").
-     */
     private void setupBluetooth() {
         try {
-            // Android 12+ (API 31) requires BLUETOOTH_CONNECT for name changes
-            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S || hasPermission(Manifest.permission.BLUETOOTH_CONNECT)) {
-                bluetoothAdapter.setName("MeshChat_" + username);
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S
+                    || hasPermission(Manifest.permission.BLUETOOTH_CONNECT)) {
+                String btName = currentNetworkName != null
+                        ? buildBtName(currentNetworkName)
+                        : "MeshChat_" + username;
+                bluetoothAdapter.setName(btName);
             }
-            // Start the Bluetooth server to accept incoming connections
-            bluetoothServerThread = new BluetoothServerThread();
-            bluetoothServerThread.start();
         } catch (SecurityException e) {
-            Log.e(TAG, "Bluetooth setup failed — permission denied: " + e.getMessage());
+            Log.w(TAG, "BT name set failed: " + e.getMessage());
         }
+        bluetoothServerThread = new BluetoothServerThread();
+        bluetoothServerThread.start();
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // BROADCAST RECEIVERS
-    // ═══════════════════════════════════════════════════════════════════
+    private String buildBtName(String networkName) {
+        String full = BT_PREFIX + networkName;
+        return full.length() > BT_NAME_MAX ? full.substring(0, BT_NAME_MAX) : full;
+    }
 
-    /**
-     * Registers broadcast receivers to listen for WiFi P2P and Bluetooth events.
-     *
-     * BROADCAST RECEIVERS explained (for beginners):
-     * ──────────────────────────────────────────────
-     * Android uses a "publish-subscribe" pattern for system events.
-     * When something happens (e.g., a Bluetooth device is found), the system
-     * "broadcasts" an Intent. Our BroadcastReceivers "catch" these broadcasts
-     * and call our code in response.
-     *
-     * It's like subscribing to push notifications — you tell Android
-     * "let me know when X happens" and it calls your onReceive() method.
-     */
+    // ─── Broadcast receivers ────────────────────────────────────────────
+
     private void registerReceivers() {
-        // ── WiFi Direct events ──
-        IntentFilter wifiFilter = new IntentFilter();
-        wifiFilter.addAction(WifiP2pManager.WIFI_P2P_STATE_CHANGED_ACTION);     // WiFi P2P on/off
-        wifiFilter.addAction(WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION);     // Peer list changed
-        wifiFilter.addAction(WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION); // Connection changed
-        context.registerReceiver(wifiP2pReceiver, wifiFilter);
-
-        // ── Bluetooth events ──
         IntentFilter btFilter = new IntentFilter();
-        btFilter.addAction(BluetoothDevice.ACTION_FOUND); // A new BT device was discovered
+        btFilter.addAction(BluetoothDevice.ACTION_FOUND);
         context.registerReceiver(bluetoothReceiver, btFilter);
     }
 
     /**
-     * Receives WiFi P2P (WiFi Direct) system broadcasts.
+     * Handles discovered Bluetooth devices.
      *
-     * WIFI_P2P_PEERS_CHANGED_ACTION → The peer list updated; request it
-     * WIFI_P2P_CONNECTION_CHANGED_ACTION → Connection status changed; check if connected
-     */
-    private final BroadcastReceiver wifiP2pReceiver = new BroadcastReceiver() {
-        @Override
-        public void onReceive(Context context, Intent intent) {
-            String action = intent.getAction();
-            if (WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION.equals(action)) {
-                // Nearby WiFi Direct peer list changed — refresh it
-                requestPeers();
-            } else if (WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION.equals(action)) {
-                // Connection state changed — check if we're now connected
-                NetworkInfo networkInfo = intent.getParcelableExtra(WifiP2pManager.EXTRA_NETWORK_INFO);
-                if (networkInfo != null && networkInfo.isConnected()) {
-                    // Connected! Get connection details (group owner IP, etc.)
-                    wifiP2pManager.requestConnectionInfo(channel, MeshManager.this);
-                }
-            }
-        }
-    };
-
-    /**
-     * Called when WiFi Direct connection info is available.
-     *
-     * In WiFi Direct, one device becomes the "Group Owner" (GO) — like a
-     * temporary WiFi access point. The other device connects to the GO.
-     *
-     * If we're NOT the group owner → we connect to the GO's server socket.
-     * If we ARE the group owner → the other device connects to our WifiServerThread.
-     */
-    @Override
-    public void onConnectionInfoAvailable(WifiP2pInfo info) {
-        if (info.groupFormed && !info.isGroupOwner && info.groupOwnerAddress != null) {
-            // We're the client — initiate TCP connection to the group owner
-            new WifiClientThread(info.groupOwnerAddress).start();
-        }
-        // If we're the group owner, our WifiServerThread handles incoming connections
-    }
-
-    /**
-     * Receives Bluetooth discovery broadcasts.
-     * When a nearby Bluetooth device is found, we check if it's a MeshChat
-     * device (name contains "MeshChat") and connect if we're not already linked.
+     * Only processes devices whose name starts with "MC_" (MeshChat prefix).
+     * Tracks their network name (for the discovery screen) and RSSI.
+     * If they're in our current network and have good enough signal, connects.
      */
     private final BroadcastReceiver bluetoothReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
-            if (BluetoothDevice.ACTION_FOUND.equals(intent.getAction())) {
-                BluetoothDevice device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
-                if (device != null) {
-                    try {
-                        String name = device.getName();
-                        String address = device.getAddress();
-                        // Track all MeshChat devices for the peer list UI
-                        if (name != null && name.contains("MeshChat")) {
-                            boolean alreadyConnected = connectedNodes.contains(address);
-                            discoveredPeers.put(address,
-                                    new PeerAdapter.PeerInfo(name, address, alreadyConnected, "bluetooth"));
-                            notifyPeersUpdated();
-                        }
-                    } catch (SecurityException e) {
-                        Log.w(TAG, "Missing Bluetooth permission for device name check");
-                    }
+            if (!BluetoothDevice.ACTION_FOUND.equals(intent.getAction())) return;
+
+            BluetoothDevice device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
+            if (device == null) return;
+
+            try {
+                String name = device.getName();
+                String address = device.getAddress();
+                if (name == null || !name.startsWith(BT_PREFIX)) return;
+
+                String networkName = name.substring(BT_PREFIX.length());
+                int rssi = intent.getShortExtra(BluetoothDevice.EXTRA_RSSI, Short.MIN_VALUE);
+                rssiValues.put(address, rssi);
+
+                // Update discovered networks list
+                Network net = discoveredNetworks.get(networkName);
+                if (net == null) {
+                    discoveredNetworks.put(networkName, new Network(networkName));
+                } else {
+                    net.nodeCount++;
                 }
+                notifyNetworksUpdated();
+
+                // Track as discovered peer
+                boolean alreadyConnected = connectedNodes.contains(address);
+                discoveredPeers.put(address, new PeerAdapter.PeerInfo(
+                        name, address, alreadyConnected, "bluetooth", rssi));
+
+                // Auto-connect if we're in the same network and signal is strong enough
+                if (currentNetworkName != null
+                        && networkName.equals(currentNetworkName)
+                        && !alreadyConnected
+                        && rssi >= rssiThreshold) {
+                    new BluetoothClientThread(device).start();
+                }
+            } catch (SecurityException e) {
+                Log.w(TAG, "BT receiver permission error: " + e.getMessage());
             }
         }
     };
 
     // ═══════════════════════════════════════════════════════════════════
-    // PEER DISCOVERY
+    // NETWORK MANAGEMENT
     // ═══════════════════════════════════════════════════════════════════
 
     /**
-     * Requests the current list of available WiFi Direct peers.
-     * When results arrive, we attempt to connect to the first available device.
-     *
-     * NOTE: We connect one at a time to prevent WiFi Direct conflicts.
-     * Once connected, that device can bridge us to the rest of the mesh.
+     * Joins an existing mesh network by name.
+     * Updates our BT device name to "MC_<name>" so peers can discover us.
      */
-    private void requestPeers() {
-        if (wifiP2pManager != null && channel != null) {
-            try {
-                wifiP2pManager.requestPeers(channel, peers -> {
-                    for (WifiP2pDevice device : peers.getDeviceList()) {
-                        String address = device.deviceAddress;
-                        boolean alreadyConnected = connectedNodes.contains(address);
-                        discoveredPeers.put(address,
-                                new PeerAdapter.PeerInfo(device.deviceName, address, alreadyConnected, "wifi"));
-                    }
-                    notifyPeersUpdated();
-                });
-            } catch (SecurityException e) {
-                Log.w(TAG, "Missing WiFi P2P permission for peer request");
-            }
+    public void joinNetwork(String networkName) {
+        this.currentNetworkName = networkName;
+        prefs.edit().putString(KEY_NETWORK_NAME, networkName).apply();
+        updateBtName();
+        startDiscovery();
+        if (messageListener != null) {
+            mainHandler.post(() -> messageListener.onNetworkJoined(networkName));
         }
+        Log.d(TAG, "Joined network: " + networkName);
     }
 
     /**
-     * Initiates a WiFi Direct connection to a discovered device.
-     *
-     * @param device The WiFi P2P device to connect to
+     * Creates a new mesh network with the given name and joins it immediately.
      */
-    private void connectToWifiP2pDevice(WifiP2pDevice device) {
-        WifiP2pConfig config = new WifiP2pConfig();
-        config.deviceAddress = device.deviceAddress;
+    public void createNetwork(String networkName) {
+        joinNetwork(networkName); // creating and joining are the same operation
+    }
+
+    /**
+     * Leaves the current network. Disconnects all peers and resets BT name.
+     */
+    public void leaveNetwork() {
+        this.currentNetworkName = null;
+        prefs.edit().remove(KEY_NETWORK_NAME).apply();
+
+        // Disconnect all peers
+        List<String> snapshot = new ArrayList<>(connectedNodes);
+        for (String mac : snapshot) {
+            notifyNodeDisconnected(mac);
+        }
+
+        // Reset BT name
         try {
-            wifiP2pManager.connect(channel, config, null);
+            if (bluetoothAdapter != null
+                    && (Build.VERSION.SDK_INT < Build.VERSION_CODES.S
+                    || hasPermission(Manifest.permission.BLUETOOTH_CONNECT))) {
+                bluetoothAdapter.setName("Android_" + Build.MODEL);
+            }
         } catch (SecurityException e) {
-            Log.w(TAG, "Missing WiFi P2P permission for connection");
+            Log.w(TAG, "BT name reset failed: " + e.getMessage());
+        }
+
+        discoveredPeers.clear();
+        if (messageListener != null) {
+            mainHandler.post(() -> messageListener.onNetworkLeft());
         }
     }
 
-    /**
-     * Starts scanning for nearby devices on both WiFi Direct and Bluetooth.
-     * Called by the UI "Scan" button and by the periodic discovery timer.
-     */
-    public void startDiscovery() {
-        // Clear old discovered peers on each fresh scan
-        discoveredPeers.clear();
-
+    private void updateBtName() {
         try {
-            if (wifiP2pManager != null && channel != null) {
-                wifiP2pManager.discoverPeers(channel, null);
+            if (bluetoothAdapter != null
+                    && (Build.VERSION.SDK_INT < Build.VERSION_CODES.S
+                    || hasPermission(Manifest.permission.BLUETOOTH_CONNECT))) {
+                bluetoothAdapter.setName(currentNetworkName != null
+                        ? buildBtName(currentNetworkName)
+                        : "MeshChat_" + username);
             }
-            // Only start BT discovery if not already scanning
+        } catch (SecurityException e) {
+            Log.w(TAG, "BT name update failed: " + e.getMessage());
+        }
+    }
+
+    /** Returns the name of the currently joined network, or null if none */
+    public String getCurrentNetworkName() { return currentNetworkName; }
+
+    /** Returns our persistent node UUID */
+    public String getMyNodeId() { return myNodeId; }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // DISCOVERY
+    // ═══════════════════════════════════════════════════════════════════
+
+    /** Starts a Bluetooth scan. Called by the UI and periodically by the scheduler. */
+    public void startDiscovery() {
+        discoveredPeers.clear();
+        try {
             if (bluetoothAdapter != null && !bluetoothAdapter.isDiscovering()) {
                 bluetoothAdapter.startDiscovery();
             }
         } catch (SecurityException e) {
-            Log.w(TAG, "Missing permission for discovery: " + e.getMessage());
+            Log.w(TAG, "Discovery permission denied: " + e.getMessage());
         }
-
-        // After a delay, notify UI of scan completion
+        // Notify UI of scan completion after ~12s (standard BT discovery duration)
         mainHandler.postDelayed(() -> {
             if (messageListener != null) {
-                messageListener.onScanComplete(discoveredPeers.size());
+                messageListener.onNetworkDiscovered(getDiscoveredNetworks());
             }
-        }, 12000); // BT discovery typically takes ~12 seconds
+        }, 12_000);
     }
 
-    /**
-     * Starts a repeating timer that scans for peers every DISCOVERY_INTERVAL_SECONDS.
-     * This ensures we keep finding new devices even without the user pressing "Scan".
-     *
-     * ScheduledExecutorService works like a repeating alarm — it runs our code
-     * on a background thread at regular intervals.
-     */
     private void startPeriodicDiscovery() {
         discoveryScheduler = Executors.newSingleThreadScheduledExecutor();
         discoveryScheduler.scheduleAtFixedRate(
-                this::startDiscovery,             // What to run
-                DISCOVERY_INTERVAL_SECONDS,       // Initial delay
-                DISCOVERY_INTERVAL_SECONDS,       // Repeat interval
-                TimeUnit.SECONDS                  // Time unit
+                this::startDiscovery,
+                DISCOVERY_INTERVAL_SEC,
+                DISCOVERY_INTERVAL_SEC,
+                TimeUnit.SECONDS
         );
+    }
+
+    /** Returns the current list of discovered mesh networks */
+    public List<Network> getDiscoveredNetworks() {
+        return new ArrayList<>(discoveredNetworks.values());
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -575,467 +456,421 @@ public class MeshManager implements WifiP2pManager.ConnectionInfoListener {
     // ═══════════════════════════════════════════════════════════════════
 
     /**
-     * Broadcasts a message to all connected peers in the mesh.
-     * This is the main method called when the user sends a new message.
-     *
-     * Message flow:
-     *   1. Add message ID to "seen" set (prevents our own message from echoing back)
-     *   2. Create an encrypted COPY for network transmission
-     *   3. If peers connected → send immediately
-     *   4. If no peers       → queue for later delivery
-     *
-     * BUG FIX: Previously this method took a String and created a NEW Message
-     * internally. That meant the UI message and network message had DIFFERENT
-     * UUIDs, breaking deduplication. Now we accept the same Message object
-     * that the UI displays, ensuring consistent IDs.
-     *
-     * @param message The Message object to broadcast (same one shown in UI)
+     * Broadcasts a message to everyone in the network.
+     * If no peers are connected, queues it for delivery when a peer joins.
      */
     public void broadcastMessage(Message message) {
-        // Mark this message as "already seen" so we ignore it if it echoes back
+        // Stamp with our proper node UUID
+        message.setSenderId(myNodeId);
+        message.setOriginalSenderId(myNodeId);
+        message.setChannelType(Message.CHANNEL_BROADCAST);
+
         processedMessages.add(message.getId());
 
-        // Create an encrypted COPY for network transmission.
-        // We copy because we don't want to modify the original Message
-        // that the UI is displaying (it should show readable text, not gibberish)
         Message networkCopy = message.copy();
         networkCopy.setContent(cryptoManager.encrypt(message.getContent()));
         networkCopy.setEncrypted(true);
 
-        // Check if we have any peers to send to
-        if (bluetoothOutputStreams.isEmpty() && wifiOutputStreams.isEmpty()) {
-            // No peers connected — queue the encrypted message for later
-            offlineMessageQueue.add(networkCopy);
-            Log.d(TAG, "No peers connected. Message queued (queue size: "
-                    + offlineMessageQueue.size() + ")");
+        if (bluetoothOutputStreams.isEmpty()) {
+            broadcastOfflineQueue.add(networkCopy);
         } else {
-            // Peers are connected! Send to all of them
-            sendToAllPeers(networkCopy);
+            sendToAllPeers(networkCopy, null);
         }
     }
 
     /**
-     * Sends a message to ALL currently connected peers via both Bluetooth and WiFi.
+     * Sends a private message to a specific peer identified by their node UUID.
      *
-     * THREAD SAFETY NOTE:
-     * ObjectOutputStream is NOT thread-safe. If two threads write to the same
-     * stream simultaneously, the data stream gets corrupted. We synchronize
-     * on each individual stream to prevent this.
-     *
-     * @param message The (encrypted) message to send over the network
+     * If the peer is directly connected, the message goes straight to them.
+     * If not, we flood it to all connected peers so the mesh can relay it.
+     * If nobody is connected, it's queued per-recipient.
      */
-    private void sendToAllPeers(Message message) {
-        // ── Send via all Bluetooth connections ──
-        for (Map.Entry<String, ObjectOutputStream> entry : bluetoothOutputStreams.entrySet()) {
-            String nodeId = entry.getKey();
-            ObjectOutputStream out = entry.getValue();
-            try {
-                // Synchronize to prevent concurrent writes corrupting the stream
-                synchronized (out) {
-                    out.writeObject(message);  // Serialize and send the Message object
-                    out.flush();               // Ensure all bytes are pushed out immediately
-                    out.reset();               // Clear ObjectOutputStream's internal object cache
-                    // reset() is CRUCIAL — without it, OOS caches previously sent objects
-                    // and sends references instead of full copies on subsequent writes.
-                    // This would cause receivers to see stale/duplicate data.
-                }
-            } catch (IOException e) {
-                Log.w(TAG, "Bluetooth send failed to " + nodeId + ": " + e.getMessage());
-                notifyNodeDisconnected(nodeId);
-            }
-        }
+    public void sendPrivateMessage(Message message, String recipientId) {
+        message.setSenderId(myNodeId);
+        message.setOriginalSenderId(myNodeId);
+        message.setRecipientId(recipientId);
+        message.setChannelType(Message.CHANNEL_PRIVATE);
 
-        // ── Send via all WiFi Direct connections ──
-        for (Map.Entry<String, ObjectOutputStream> entry : wifiOutputStreams.entrySet()) {
-            String nodeId = entry.getKey();
-            ObjectOutputStream out = entry.getValue();
-            try {
-                synchronized (out) {
-                    out.writeObject(message);
-                    out.flush();
-                    out.reset();
-                }
-            } catch (IOException e) {
-                Log.w(TAG, "WiFi send failed to " + nodeId + ": " + e.getMessage());
-                notifyNodeDisconnected(nodeId);
-            }
-        }
-    }
-
-    // ═══════════════════════════════════════════════════════════════════
-    // MESSAGE RECEIVING & FORWARDING
-    // ═══════════════════════════════════════════════════════════════════
-
-    /**
-     * Processes an incoming message from another device in the mesh.
-     *
-     * Three responsibilities:
-     *   1. DEDUPLICATION → Skip messages we've already seen
-     *   2. FORWARDING    → Relay the message to other peers (if hop limit allows)
-     *   3. DELIVERY      → Decrypt and notify the UI
-     *
-     * FORWARDING happens BEFORE decryption because:
-     * - We forward the encrypted version (more secure — relay nodes
-     *   don't need to decrypt just to forward)
-     * - The hop count check prevents infinite chains
-     *
-     * @param message The incoming Message from a connected peer
-     */
-    private void handleIncomingMessage(Message message) {
-        // ── Step 1: Deduplication ──
-        // Have we already seen this message? (could arrive via multiple mesh paths)
-        if (processedMessages.contains(message.getId())) {
-            return; // Already processed — discard this duplicate
-        }
         processedMessages.add(message.getId());
 
-        // ── Step 2: Forward to other peers (this is what makes it a MESH!) ──
-        // Each node acts as a relay, passing messages further into the network
-        if (message.canForward()) {
-            message.incrementHopCount();  // Record that we're one more hop along
-            sendToAllPeers(message);      // Forward the still-encrypted message
+        Message networkCopy = message.copy();
+        networkCopy.setContent(cryptoManager.encrypt(message.getContent()));
+        networkCopy.setEncrypted(true);
+
+        String recipientMac = nodeIdToAddress.get(recipientId);
+        if (recipientMac != null && connectedNodes.contains(recipientMac)) {
+            // Direct link — send only to the recipient
+            sendToNode(recipientMac, networkCopy);
+        } else if (!bluetoothOutputStreams.isEmpty()) {
+            // Relay through mesh
+            sendToAllPeers(networkCopy, null);
+        } else {
+            // No peers — queue for when they connect
+            perRecipientQueue
+                    .computeIfAbsent(recipientId, k -> new ConcurrentLinkedQueue<>())
+                    .add(networkCopy);
+        }
+    }
+
+    /**
+     * Sends a message to all connected peers, optionally excluding the source.
+     *
+     * @param excludeAddress BT MAC to skip (the peer we received this message from),
+     *                       or null to send to everyone.
+     */
+    private void sendToAllPeers(Message message, String excludeAddress) {
+        for (Map.Entry<String, ObjectOutputStream> entry : bluetoothOutputStreams.entrySet()) {
+            String mac = entry.getKey();
+            if (mac.equals(excludeAddress)) continue;
+            writeToStream(entry.getValue(), message, mac);
+        }
+    }
+
+    /** Sends a message to a single specific peer by BT MAC address */
+    private void sendToNode(String mac, Message message) {
+        ObjectOutputStream out = bluetoothOutputStreams.get(mac);
+        if (out != null) {
+            writeToStream(out, message, mac);
+        }
+    }
+
+    private void writeToStream(ObjectOutputStream out, Message message, String nodeId) {
+        try {
+            synchronized (out) {
+                out.writeObject(message);
+                out.flush();
+                out.reset();
+            }
+        } catch (IOException e) {
+            Log.w(TAG, "Write to " + nodeId + " failed: " + e.getMessage());
+            notifyNodeDisconnected(nodeId);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // MESSAGE RECEIVING & ROUTING
+    // ═══════════════════════════════════════════════════════════════════
+
+    /**
+     * Processes every incoming message from a peer socket.
+     *
+     * @param message     The incoming message object
+     * @param sourceAddress BT MAC of the peer who sent it (for relay exclusion)
+     */
+    private void handleIncomingMessage(Message message, String sourceAddress) {
+        // ── Control frames (handshake / ACK) ──
+        if (message.getSubType() == Message.SUBTYPE_HANDSHAKE) {
+            handleHandshake(message, sourceAddress);
+            return;
+        }
+        if (message.getSubType() == Message.SUBTYPE_ACK) {
+            handleAck(message);
+            return;
         }
 
-        // ── Step 3: Decrypt and deliver to the UI ──
+        // ── Deduplication ──
+        if (processedMessages.contains(message.getId())) return;
+        processedMessages.add(message.getId());
+
+        // ── TTL check ──
+        if (message.isExpired()) {
+            Log.d(TAG, "Dropped expired message: " + message.getId());
+            return;
+        }
+
+        String recipientId = message.getRecipientId();
+
+        // ── Private message NOT addressed to us → relay only ──
+        if (recipientId != null && !recipientId.equals(myNodeId)) {
+            if (!message.canForward()) return;
+            message.incrementHopCount();
+            // Try to find the recipient's MAC for a direct hop
+            String recipientMac = nodeIdToAddress.get(recipientId);
+            if (recipientMac != null && connectedNodes.contains(recipientMac)) {
+                sendToNode(recipientMac, message); // final hop!
+            } else {
+                sendToAllPeers(message, sourceAddress); // flood forward
+            }
+            return; // Do NOT show in UI
+        }
+
+        // ── Broadcast messages → forward to other peers ──
+        if (recipientId == null && message.canForward()) {
+            message.incrementHopCount();
+            sendToAllPeers(message, sourceAddress);
+        }
+
+        // ── Private message FOR US → send ACK ──
+        if (recipientId != null && recipientId.equals(myNodeId)) {
+            sendAck(message.getId(), message.getSenderId(), sourceAddress);
+        }
+
+        // ── Decrypt and deliver to UI ──
         if (message.isEncrypted()) {
-            String decryptedContent = cryptoManager.decrypt(message.getContent());
-            message.setContent(decryptedContent);
+            String decrypted = cryptoManager.decrypt(message.getContent());
+            message.setContent(decrypted);
             message.setEncrypted(false);
         }
-
-        // Mark as "received" for the UI (shows on the left side of the chat)
         message.setType(Message.TYPE_RECEIVED);
 
-        // Notify the UI on the main thread (Android requires UI updates on main thread)
         if (messageListener != null) {
             mainHandler.post(() -> messageListener.onMessageReceived(message));
         }
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // OFFLINE MESSAGE QUEUE
-    // ═══════════════════════════════════════════════════════════════════
+    // ─── Handshake ──────────────────────────────────────────────────────
 
     /**
-     * Sends all queued offline messages to the newly connected peer.
-     * Called automatically whenever a new node joins the mesh.
-     *
-     * USE CASE: You type messages while alone in a dead zone. When someone
-     * walks into Bluetooth/WiFi range, all your queued messages are
-     * delivered automatically — no manual action needed!
+     * Sends our identity to a newly connected peer.
+     * Must be called immediately after the ObjectOutputStream is ready.
      */
-    private void flushOfflineQueue() {
-        if (offlineMessageQueue.isEmpty()) return;
-
-        int count = 0;
-        Message queuedMsg;
-        // poll() retrieves AND removes the head of the queue (thread-safe)
-        while ((queuedMsg = offlineMessageQueue.poll()) != null) {
-            sendToAllPeers(queuedMsg);
-            count++;
+    private void sendHandshake(ObjectOutputStream out) {
+        Message handshake = Message.createHandshake(username, myNodeId);
+        try {
+            synchronized (out) {
+                out.writeObject(handshake);
+                out.flush();
+                out.reset();
+            }
+        } catch (IOException e) {
+            Log.w(TAG, "Handshake send failed: " + e.getMessage());
         }
-
-        // Notify the UI that queued messages were delivered
-        if (messageListener != null && count > 0) {
-            int flushedCount = count;
-            mainHandler.post(() -> messageListener.onQueueFlushed(flushedCount));
-        }
-        Log.d(TAG, "Flushed " + count + " offline messages to mesh");
     }
 
-    /**
-     * Returns how many messages are waiting in the offline queue.
-     * Useful for showing "X messages pending" in the UI.
-     */
-    public int getQueuedMessageCount() {
-        return offlineMessageQueue.size();
+    /** Processes an incoming handshake, mapping the peer's UUID to their BT MAC */
+    private void handleHandshake(Message message, String sourceMac) {
+        String content = message.getContent();
+        String[] parts = content.split("\\|", 2);
+        if (parts.length < 2) return;
+
+        String peerUsername = parts[0];
+        String peerNodeId = parts[1];
+
+        // Store bidirectional UUID ↔ MAC mapping
+        nodeIdToAddress.put(peerNodeId, sourceMac);
+        addressToNodeId.put(sourceMac, peerNodeId);
+        nodeNames.put(peerNodeId, peerUsername);
+
+        Log.d(TAG, "Handshake from " + peerUsername + " (" + peerNodeId + ") @ " + sourceMac);
+        notifyNodeInfoUpdated();
+
+        // Flush any queued private messages for this peer
+        flushPerRecipientQueue(peerNodeId, sourceMac);
+    }
+
+    // ─── ACK ────────────────────────────────────────────────────────────
+
+    private void sendAck(String originalMsgId, String originalSenderId, String sourceMac) {
+        Message ack = Message.createAck(originalMsgId, myNodeId, originalSenderId);
+        sendToNode(sourceMac, ack); // ACK goes directly back to sender
+    }
+
+    private void handleAck(Message ack) {
+        String originalMsgId = ack.getContent();
+        if (messageListener != null) {
+            mainHandler.post(() -> messageListener.onDeliveryStatusChanged(originalMsgId));
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // OFFLINE QUEUES
+    // ═══════════════════════════════════════════════════════════════════
+
+    private void flushBroadcastQueue() {
+        if (broadcastOfflineQueue.isEmpty()) return;
+        int count = 0;
+        Message msg;
+        while ((msg = broadcastOfflineQueue.poll()) != null) {
+            sendToAllPeers(msg, null);
+            count++;
+        }
+        if (messageListener != null && count > 0) {
+            int total = count;
+            mainHandler.post(() -> messageListener.onQueueFlushed(total));
+        }
+    }
+
+    private void flushPerRecipientQueue(String recipientId, String recipientMac) {
+        ConcurrentLinkedQueue<Message> queue = perRecipientQueue.get(recipientId);
+        if (queue == null || queue.isEmpty()) return;
+        Message msg;
+        while ((msg = queue.poll()) != null) {
+            sendToNode(recipientMac, msg);
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════
     // NODE CONNECTION MANAGEMENT
     // ═══════════════════════════════════════════════════════════════════
 
-    /**
-     * Called when a new device successfully connects to our mesh.
-     * Tracks the node, notifies the UI, and flushes any queued messages.
-     *
-     * @param nodeId Unique ID of the connected node (MAC or IP address)
-     */
-    private void notifyNodeConnected(String nodeId) {
-        connectedNodes.add(nodeId);
-
-        // Notify UI about the new connection
-        if (messageListener != null) {
-            mainHandler.post(() -> messageListener.onNodeConnected(nodeId));
-        }
-
-        // A new peer is here! Send any messages queued while we were offline
-        flushOfflineQueue();
+    private void notifyNodeConnected(String mac) {
+        connectedNodes.add(mac);
+        notifyNodeInfoUpdated();
+        flushBroadcastQueue();
     }
 
-    /**
-     * Called when a device disconnects from our mesh.
-     * Cleans up ALL resources for that node: streams, sockets, tracking data.
-     *
-     * @param nodeId Unique ID of the disconnected node
-     */
-    private void notifyNodeDisconnected(String nodeId) {
-        connectedNodes.remove(nodeId);
+    private void notifyNodeDisconnected(String mac) {
+        connectedNodes.remove(mac);
 
-        // Close and remove output streams (must close explicitly to flush buffers)
-        ObjectOutputStream btOut = bluetoothOutputStreams.remove(nodeId);
-        if (btOut != null) { try { btOut.close(); } catch (IOException e) { /* OK */ } }
+        ObjectOutputStream out = bluetoothOutputStreams.remove(mac);
+        if (out != null) { try { out.close(); } catch (IOException ignored) {} }
 
-        ObjectOutputStream wifiOut = wifiOutputStreams.remove(nodeId);
-        if (wifiOut != null) { try { wifiOut.close(); } catch (IOException e) { /* OK */ } }
+        BluetoothSocket sock = bluetoothSockets.remove(mac);
+        if (sock != null) { try { sock.close(); } catch (IOException ignored) {} }
 
-        // Close the underlying sockets
-        BluetoothSocket btSocket = bluetoothSockets.remove(nodeId);
-        if (btSocket != null) { try { btSocket.close(); } catch (IOException e) { /* OK */ } }
+        // Clean up identity maps
+        String uuid = addressToNodeId.remove(mac);
+        if (uuid != null) nodeIdToAddress.remove(uuid);
 
-        Socket wifiSocket = wifiSockets.remove(nodeId);
-        if (wifiSocket != null) { try { wifiSocket.close(); } catch (IOException e) { /* OK */ } }
-
-        // Notify UI about the disconnection
-        if (messageListener != null) {
-            mainHandler.post(() -> messageListener.onNodeDisconnected(nodeId));
-        }
+        notifyNodeInfoUpdated();
     }
 
     // ═══════════════════════════════════════════════════════════════════
     // PUBLIC API
     // ═══════════════════════════════════════════════════════════════════
 
-    /** Sets the listener that receives mesh network event callbacks */
     public void setMessageListener(MessageListener listener) {
         this.messageListener = listener;
     }
 
-    /** Returns the count of currently connected nodes in the mesh */
-    public int getConnectedNodeCount() {
-        return connectedNodes.size();
+    public int getConnectedNodeCount() { return connectedNodes.size(); }
+
+    public int getQueuedMessageCount() {
+        int count = broadcastOfflineQueue.size();
+        for (ConcurrentLinkedQueue<Message> q : perRecipientQueue.values()) {
+            count += q.size();
+        }
+        return count;
     }
 
-    /** Returns the CryptoManager for changing the encryption passphrase */
-    public CryptoManager getCryptoManager() {
-        return cryptoManager;
+    /** Returns live info about all currently connected peer nodes */
+    public List<NodeInfo> getConnectedNodeInfos() {
+        List<NodeInfo> result = new ArrayList<>();
+        for (String mac : connectedNodes) {
+            String uuid = addressToNodeId.getOrDefault(mac, mac);
+            String name = nodeNames.getOrDefault(uuid, "Unknown");
+            int rssi = rssiValues.getOrDefault(mac, Integer.MIN_VALUE);
+            result.add(new NodeInfo(uuid, mac, name, rssi, true));
+        }
+        return result;
     }
 
-    /** Returns the user's chosen display name */
-    public String getUsername() {
-        return username;
+    /** Returns the display name associated with a peer node UUID */
+    public String getPeerName(String nodeId) {
+        return nodeNames.getOrDefault(nodeId, "Unknown");
     }
 
-    /** Returns whether this device is currently visible to others */
-    public boolean isVisible() {
-        return visible;
-    }
+    public String getUsername() { return username; }
+    public boolean isVisible() { return visible; }
+    public CryptoManager getCryptoManager() { return cryptoManager; }
 
     /**
-     * Toggles visibility on/off. When hidden, we stop Bluetooth advertising
-     * and WiFi Direct group creation so other devices can't discover us.
-     * We can still send/receive messages on existing connections.
+     * Updates the RSSI threshold used for auto-connection decisions.
+     * Persists the value to SharedPreferences.
+     *
+     * @param threshold RSSI value in dBm (e.g. -80). Devices with signal
+     *                  >= this are auto-connected; others are relay-only.
      */
+    public void setRssiThreshold(int threshold) {
+        this.rssiThreshold = threshold;
+        prefs.edit().putInt(KEY_RSSI_THRESHOLD, threshold).apply();
+    }
+
+    public int getRssiThreshold() { return rssiThreshold; }
+
     public void setVisible(boolean visible) {
         this.visible = visible;
-        if (visible) {
-            // Re-advertise by resetting BT name and restarting servers if needed
-            try {
-                if (bluetoothAdapter != null &&
-                        (Build.VERSION.SDK_INT < Build.VERSION_CODES.S ||
-                                hasPermission(Manifest.permission.BLUETOOTH_CONNECT))) {
-                    bluetoothAdapter.setName("MeshChat_" + username);
-                }
-            } catch (SecurityException e) {
-                Log.w(TAG, "Cannot set BT name: " + e.getMessage());
-            }
-            Log.d(TAG, "Visibility ON — device is discoverable");
-        } else {
-            // Stop advertising by cancelling discovery and changing BT name
-            try {
-                if (bluetoothAdapter != null) {
+        try {
+            if (bluetoothAdapter != null
+                    && (Build.VERSION.SDK_INT < Build.VERSION_CODES.S
+                    || hasPermission(Manifest.permission.BLUETOOTH_CONNECT))) {
+                if (visible) {
+                    updateBtName();
+                } else {
+                    bluetoothAdapter.setName("Android_" + Build.MODEL);
                     bluetoothAdapter.cancelDiscovery();
-                    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S ||
-                            hasPermission(Manifest.permission.BLUETOOTH_CONNECT)) {
-                        // Set a non-MeshChat name so others won't try to connect
-                        bluetoothAdapter.setName("Android_" + Build.MODEL);
-                    }
-                }
-            } catch (SecurityException e) {
-                Log.w(TAG, "Cannot update BT name: " + e.getMessage());
-            }
-            Log.d(TAG, "Visibility OFF — device is hidden");
-        }
-    }
-
-    /** Returns the current list of discovered peers */
-    public List<PeerAdapter.PeerInfo> getDiscoveredPeers() {
-        // Update connected status before returning
-        List<PeerAdapter.PeerInfo> peerList = new ArrayList<>();
-        for (Map.Entry<String, PeerAdapter.PeerInfo> entry : discoveredPeers.entrySet()) {
-            PeerAdapter.PeerInfo p = entry.getValue();
-            boolean connected = connectedNodes.contains(p.address);
-            peerList.add(new PeerAdapter.PeerInfo(p.name, p.address, connected, p.type));
-        }
-        return peerList;
-    }
-
-    /**
-     * Connects to a specific peer by address. Called from the peer list UI
-     * when the user taps "Connect" on a discovered device.
-     */
-    public void connectToPeer(PeerAdapter.PeerInfo peer) {
-        if (connectedNodes.contains(peer.address)) {
-            Log.d(TAG, "Already connected to " + peer.address);
-            return;
-        }
-
-        if ("bluetooth".equals(peer.type)) {
-            // Look up the BluetoothDevice and connect
-            if (bluetoothAdapter != null) {
-                try {
-                    BluetoothDevice device = bluetoothAdapter.getRemoteDevice(peer.address);
-                    new BluetoothClientThread(device).start();
-                } catch (Exception e) {
-                    Log.e(TAG, "Failed to connect to BT device: " + e.getMessage());
                 }
             }
-        } else if ("wifi".equals(peer.type)) {
-            // WiFi Direct connection
-            WifiP2pConfig config = new WifiP2pConfig();
-            config.deviceAddress = peer.address;
-            try {
-                if (wifiP2pManager != null && channel != null) {
-                    wifiP2pManager.connect(channel, config, null);
-                }
-            } catch (SecurityException e) {
-                Log.w(TAG, "WiFi P2P connect permission denied: " + e.getMessage());
-            }
+        } catch (SecurityException e) {
+            Log.w(TAG, "Visibility change failed: " + e.getMessage());
         }
     }
 
-    /** Notifies the listener about updated peer list */
-    private void notifyPeersUpdated() {
-        if (messageListener != null) {
-            List<PeerAdapter.PeerInfo> peerList = getDiscoveredPeers();
-            mainHandler.post(() -> messageListener.onPeerDiscovered(peerList));
-        }
+    // ─── Listener notifications ─────────────────────────────────────────
+
+    private void notifyNodeInfoUpdated() {
+        if (messageListener == null) return;
+        List<NodeInfo> nodes = getConnectedNodeInfos();
+        mainHandler.post(() -> messageListener.onNodeInfoUpdated(nodes));
     }
 
-    /**
-     * Shuts down the mesh manager and releases ALL resources.
-     * Called when the foreground service stops or the app is closing.
-     *
-     * ORDER MATTERS: We stop discovery first, then unregister receivers,
-     * then stop server threads, then close streams, then close sockets.
-     */
+    private void notifyNetworksUpdated() {
+        if (messageListener == null) return;
+        List<Network> nets = getDiscoveredNetworks();
+        mainHandler.post(() -> messageListener.onNetworkDiscovered(nets));
+    }
+
+    // ─── Permission helper ──────────────────────────────────────────────
+
+    private boolean hasPermission(String permission) {
+        return ContextCompat.checkSelfPermission(context, permission)
+                == PackageManager.PERMISSION_GRANTED;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // CLEANUP
+    // ═══════════════════════════════════════════════════════════════════
+
     public void cleanup() {
-        // ── Stop periodic discovery scheduler ──
         if (discoveryScheduler != null && !discoveryScheduler.isShutdown()) {
             discoveryScheduler.shutdownNow();
         }
-
-        // ── Unregister broadcast receivers ──
-        // try-catch because unregistering an already-unregistered receiver crashes
-        try { context.unregisterReceiver(wifiP2pReceiver); } catch (Exception e) { /* OK */ }
-        try { context.unregisterReceiver(bluetoothReceiver); } catch (Exception e) { /* OK */ }
-
-        // ── Stop server threads ──
-        if (wifiServerThread != null) wifiServerThread.interrupt();
+        try { context.unregisterReceiver(bluetoothReceiver); } catch (Exception ignored) {}
         if (bluetoothServerThread != null) bluetoothServerThread.interrupt();
 
-        // ── Close all output streams ──
         for (ObjectOutputStream out : bluetoothOutputStreams.values()) {
-            try { out.close(); } catch (IOException e) { /* OK */ }
+            try { out.close(); } catch (IOException ignored) {}
         }
-        for (ObjectOutputStream out : wifiOutputStreams.values()) {
-            try { out.close(); } catch (IOException e) { /* OK */ }
-        }
-
-        // ── Close all sockets ──
         for (BluetoothSocket s : bluetoothSockets.values()) {
-            try { s.close(); } catch (IOException e) { /* OK */ }
+            try { s.close(); } catch (IOException ignored) {}
         }
-        for (Socket s : wifiSockets.values()) {
-            try { s.close(); } catch (IOException e) { /* OK */ }
-        }
-
-        Log.d(TAG, "MeshManager cleaned up — all resources released.");
+        Log.d(TAG, "MeshManager cleaned up.");
     }
 
     // ═══════════════════════════════════════════════════════════════════
     // NETWORKING THREADS
     // ═══════════════════════════════════════════════════════════════════
-    //
-    // WHY THREADS? (for beginners)
-    // ────────────────────────────
-    // Network operations (connecting, sending, receiving) can take a long
-    // time. If we did these on the main (UI) thread, the app would freeze
-    // and Android would show "App Not Responding" (ANR) and crash.
-    //
-    // So we use background threads — they run independently while the UI
-    // stays smooth. Think of threads as workers doing heavy lifting in the
-    // background while you continue chatting.
-    //
-    // Thread types:
-    // 1. BluetoothServerThread  → Listens for incoming BT connections
-    // 2. BluetoothClientThread  → Connects to a discovered BT device
-    // 3. WifiServerThread       → Listens for incoming WiFi connections
-    // 4. WifiClientThread       → Connects to a WiFi Direct group owner
-    // 5. MessageReceiverThread  → Reads messages from ANY connected socket
-    //
 
     /**
-     * ─── BluetoothServerThread ─────────────────────────────────────────
-     * Listens for incoming Bluetooth connections from other MeshChat devices.
-     *
-     * How it works (like a restaurant host):
-     *   1. Creates a "server socket" — like opening the restaurant doors
-     *   2. Calls accept() — waits for a guest to arrive (blocks until one does)
-     *   3. When a guest arrives — hands them off to a MessageReceiverThread
-     *   4. Goes back to waiting for the next guest
-     *   5. Repeats forever until interrupted
+     * Listens for incoming Bluetooth RFCOMM connections.
+     * Runs in a background thread to avoid blocking the UI.
      */
     private class BluetoothServerThread extends Thread {
-        BluetoothServerThread() {
-            setName("BT-Server"); // Name threads for easier debugging in logs
-        }
+
+        BluetoothServerThread() { setName("BT-Server"); }
 
         @Override
         public void run() {
             try (BluetoothServerSocket serverSocket =
-                         bluetoothAdapter.listenUsingRfcommWithServiceRecord(SERVICE_NAME, MY_UUID)) {
-                Log.d(TAG, "Bluetooth server started — waiting for connections...");
-
+                         bluetoothAdapter.listenUsingRfcommWithServiceRecord(
+                                 SERVICE_NAME, MY_UUID)) {
+                Log.d(TAG, "BT server listening...");
                 while (!isInterrupted()) {
-                    // accept() BLOCKS here until another MeshChat device connects
                     BluetoothSocket socket = serverSocket.accept();
-                    String address = socket.getRemoteDevice().getAddress();
-                    Log.d(TAG, "Bluetooth connection accepted from: " + address);
-
-                    // Track the socket for cleanup
-                    bluetoothSockets.put(address, socket);
-
-                    // Start handling messages on this connection
+                    String mac = socket.getRemoteDevice().getAddress();
+                    bluetoothSockets.put(mac, socket);
                     new MessageReceiverThread(socket).start();
                 }
             } catch (IOException e) {
-                Log.e(TAG, "Bluetooth server error: " + e.getMessage());
+                if (!isInterrupted()) Log.e(TAG, "BT server error: " + e.getMessage());
             } catch (SecurityException e) {
-                Log.e(TAG, "Bluetooth server — permission denied: " + e.getMessage());
+                Log.e(TAG, "BT server permission denied: " + e.getMessage());
             }
         }
     }
 
     /**
-     * ─── BluetoothClientThread ─────────────────────────────────────────
-     * Initiates a Bluetooth connection to a discovered MeshChat device.
-     *
-     * When our bluetoothReceiver finds a device named "MeshChat_*",
-     * this thread connects to its Bluetooth server.
-     *
-     * Uses RFCOMM (Radio Frequency Communication) — a Bluetooth protocol
-     * that provides a reliable data stream, like a serial cable but wireless.
+     * Initiates an outgoing Bluetooth connection to a discovered peer.
      */
     private class BluetoothClientThread extends Thread {
         private final BluetoothDevice device;
@@ -1048,179 +883,67 @@ public class MeshManager implements WifiP2pManager.ConnectionInfoListener {
         @Override
         public void run() {
             try {
-                // Create a socket targeting the remote device's MeshChat service (UUID)
-                BluetoothSocket socket = device.createRfcommSocketToServiceRecord(MY_UUID);
-                Log.d(TAG, "Connecting to Bluetooth device: " + device.getAddress());
-
-                socket.connect(); // Blocks until connected or fails
-
-                // Track and start receiving
+                BluetoothSocket socket =
+                        device.createRfcommSocketToServiceRecord(MY_UUID);
+                Log.d(TAG, "Connecting to: " + device.getAddress());
+                socket.connect();
                 bluetoothSockets.put(device.getAddress(), socket);
                 new MessageReceiverThread(socket).start();
-
-                Log.d(TAG, "Bluetooth connected to: " + device.getAddress());
             } catch (IOException e) {
-                Log.e(TAG, "Bluetooth connection failed: " + e.getMessage());
+                Log.e(TAG, "BT connect failed: " + e.getMessage());
             } catch (SecurityException e) {
-                Log.e(TAG, "Bluetooth client — permission denied: " + e.getMessage());
+                Log.e(TAG, "BT connect permission denied: " + e.getMessage());
             }
         }
     }
 
     /**
-     * ─── WifiServerThread ──────────────────────────────────────────────
-     * Listens for incoming WiFi Direct TCP connections on WIFI_PORT (8888).
+     * Manages bidirectional messaging on an established Bluetooth connection.
      *
-     * When this device is the WiFi Direct "Group Owner" (like a temporary
-     * access point), other devices connect to us through this server.
-     *
-     * Uses standard Java TCP sockets — the same networking code used
-     * for web servers, game servers, etc.
-     */
-    private class WifiServerThread extends Thread {
-        WifiServerThread() {
-            setName("WiFi-Server");
-        }
-
-        @Override
-        public void run() {
-            try (ServerSocket serverSocket = new ServerSocket(WIFI_PORT)) {
-                serverSocket.setReuseAddress(true); // Allow quick restart if port was recently used
-                Log.d(TAG, "WiFi server started on port " + WIFI_PORT);
-
-                while (!isInterrupted()) {
-                    // Wait for a WiFi Direct client to connect
-                    Socket socket = serverSocket.accept();
-                    String address = socket.getInetAddress().getHostAddress();
-                    Log.d(TAG, "WiFi client connected: " + address);
-
-                    // Track and handle
-                    wifiSockets.put(address, socket);
-                    new MessageReceiverThread(socket).start();
-                }
-            } catch (IOException e) {
-                if (!isInterrupted()) {
-                    Log.e(TAG, "WiFi server error: " + e.getMessage());
-                }
-            }
-        }
-    }
-
-    /**
-     * ─── WifiClientThread ──────────────────────────────────────────────
-     * Connects to the WiFi Direct Group Owner's TCP server.
-     *
-     * When we join a WiFi Direct group and we're NOT the group owner,
-     * we connect to the owner's IP address to exchange messages.
-     */
-    private class WifiClientThread extends Thread {
-        private final InetAddress host;
-
-        WifiClientThread(InetAddress host) {
-            this.host = host;
-            setName("WiFi-Client-" + host.getHostAddress());
-        }
-
-        @Override
-        public void run() {
-            try {
-                Socket socket = new Socket(host, WIFI_PORT);
-                String address = host.getHostAddress();
-                Log.d(TAG, "WiFi connected to group owner: " + address);
-
-                wifiSockets.put(address, socket);
-                new MessageReceiverThread(socket).start();
-            } catch (IOException e) {
-                Log.e(TAG, "WiFi client connection failed: " + e.getMessage());
-            }
-        }
-    }
-
-    /**
-     * ─── MessageReceiverThread ─────────────────────────────────────────
-     * Handles communication on an established connection (Bluetooth OR WiFi).
-     * Sets up serialization streams and continuously reads incoming messages.
-     *
-     * ★ CRITICAL: STREAM INITIALIZATION ORDER MATTERS! ★
-     * ──────────────────────────────────────────────────
-     * ObjectOutputStream MUST be created and flushed BEFORE ObjectInputStream.
-     *
-     * Why? ObjectOutputStream's constructor writes a "stream header" to the
-     * output. ObjectInputStream's constructor tries to READ a header from
-     * the input. If both sides create ObjectInputStream first, they'll BOTH
-     * block waiting for a header that never comes → DEADLOCK!
-     *
-     * Correct order (both devices follow this):
-     *   1. new ObjectOutputStream(...)  → writes our header to the output
-     *   2. out.flush()                  → pushes the header to the other side
-     *   3. new ObjectInputStream(...)   → reads the OTHER side's header
-     *
-     * Since both sides create the output stream first and flush, each side
-     * sends its header before trying to read the other's. No deadlock!
+     * DEADLOCK PREVENTION: ObjectOutputStream MUST be created and flushed
+     * before ObjectInputStream. Both sides do this — they write their stream
+     * header first, then read the remote header. This prevents both sides
+     * from blocking forever waiting for the other's header.
      */
     private class MessageReceiverThread extends Thread {
-        private final Object socket; // Can be BluetoothSocket or Socket (WiFi)
+        private final BluetoothSocket socket;
 
-        MessageReceiverThread(Object socket) {
+        MessageReceiverThread(BluetoothSocket socket) {
             this.socket = socket;
             setName("MsgReceiver-" + socket.hashCode());
         }
 
         @Override
         public void run() {
-            String nodeId = "";
+            String mac = "";
             try {
-                ObjectOutputStream out;
-                ObjectInputStream in;
+                mac = socket.getRemoteDevice().getAddress();
 
-                if (socket instanceof BluetoothSocket) {
-                    // ── Bluetooth connection setup ──
-                    BluetoothSocket btSocket = (BluetoothSocket) socket;
-                    nodeId = btSocket.getRemoteDevice().getAddress();
+                // Output stream first (writes header), then flush, then input stream
+                ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
+                out.flush();
+                bluetoothOutputStreams.put(mac, out);
 
-                    // MUST: Create output stream FIRST and flush (see deadlock note above)
-                    out = new ObjectOutputStream(btSocket.getOutputStream());
-                    out.flush();
-                    bluetoothOutputStreams.put(nodeId, out);
+                ObjectInputStream in = new ObjectInputStream(socket.getInputStream());
 
-                    // Now safe to create input stream (the other side already sent their header)
-                    in = new ObjectInputStream(btSocket.getInputStream());
-                } else {
-                    // ── WiFi connection setup ──
-                    Socket wifiSocket = (Socket) socket;
-                    nodeId = wifiSocket.getInetAddress().getHostAddress();
+                // Send our handshake immediately after streams are ready
+                sendHandshake(out);
 
-                    out = new ObjectOutputStream(wifiSocket.getOutputStream());
-                    out.flush();
-                    wifiOutputStreams.put(nodeId, out);
+                notifyNodeConnected(mac);
 
-                    in = new ObjectInputStream(wifiSocket.getInputStream());
-                }
-
-                // Connection fully established — notify UI and flush offline queue
-                notifyNodeConnected(nodeId);
-
-                // ── Message receiving loop ──
-                // Continuously read Message objects from the stream.
-                // readObject() blocks until a message arrives or the connection drops.
+                // Read loop — blocks until a message arrives or connection drops
                 while (!isInterrupted()) {
                     Object received = in.readObject();
                     if (received instanceof Message) {
-                        handleIncomingMessage((Message) received);
+                        handleIncomingMessage((Message) received, mac);
                     }
                 }
             } catch (IOException e) {
-                // Connection broken (device out of range, app closed, etc.)
-                Log.d(TAG, "Connection lost with node: " + nodeId);
-                if (!nodeId.isEmpty()) {
-                    notifyNodeDisconnected(nodeId);
-                }
+                Log.d(TAG, "Connection lost: " + mac);
             } catch (ClassNotFoundException e) {
-                // Received an object we don't recognize (version mismatch?)
-                Log.e(TAG, "Unknown object type from node: " + nodeId);
-                if (!nodeId.isEmpty()) {
-                    notifyNodeDisconnected(nodeId);
-                }
+                Log.e(TAG, "Unknown object from: " + mac);
+            } finally {
+                if (!mac.isEmpty()) notifyNodeDisconnected(mac);
             }
         }
     }

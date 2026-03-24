@@ -11,126 +11,99 @@ import androidx.recyclerview.widget.RecyclerView;
 import java.util.List;
 
 /**
- * ============================================================================
- * MessageAdapter - Bridges message data with the chat UI
- * ============================================================================
+ * MessageAdapter — RecyclerView adapter for the chat message timeline.
  *
- * WHAT IS A RECYCLERVIEW ADAPTER? (for beginners)
- * ───────────────────────────────────────────────
- * RecyclerView is Android's efficient scrollable list. Instead of creating
- * a View for every single message (which wastes memory), it "recycles"
- * views that scroll off-screen and reuses them for new messages.
+ * Two view types:
+ *  - TYPE_SENT (1): right-aligned teal bubble
+ *  - TYPE_RECEIVED (0): left-aligned grey bubble with sender name above
  *
- * The Adapter is the bridge between your DATA (List<Message>) and the
- * VIEWS (what the user sees). It tells RecyclerView:
- *  - How many items are there?  → getItemCount()
- *  - What does item #N look like?  → onCreateViewHolder() + onBindViewHolder()
- *  - Is this a sent or received message?  → getItemViewType()
- *
- * Two different layouts are used:
- *  - item_message_sent.xml     → Right-aligned, colored bubble (our messages)
- *  - item_message_received.xml → Left-aligned, gray bubble (others' messages)
- *
- * ============================================================================
+ * Delivery status indicator on sent private messages:
+ *  - "✓"  = DELIVERY_SENT (transmitted)
+ *  - "✓✓" = DELIVERY_DELIVERED (recipient ACK received)
  */
-public class MessageAdapter extends RecyclerView.Adapter<MessageAdapter.MessageViewHolder> {
+public class MessageAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> {
 
-    /** The list of messages to display in the chat */
-    private List<Message> messages;
+    private final List<Message> messages;
 
     public MessageAdapter(List<Message> messages) {
         this.messages = messages;
     }
 
-    /**
-     * Creates a new ViewHolder for a message bubble.
-     * Called when RecyclerView needs a brand new view (not recycled).
-     *
-     * @param viewType TYPE_SENT (1) or TYPE_RECEIVED (0) — determines which layout to inflate
-     */
-    @NonNull
-    @Override
-    public MessageViewHolder onCreateViewHolder(@NonNull ViewGroup parent, int viewType) {
-        View view;
-        if (viewType == Message.TYPE_SENT) {
-            // Our message → right-aligned bubble
-            view = LayoutInflater.from(parent.getContext())
-                    .inflate(R.layout.item_message_sent, parent, false);
-        } else {
-            // Someone else's message → left-aligned bubble
-            view = LayoutInflater.from(parent.getContext())
-                    .inflate(R.layout.item_message_received, parent, false);
-        }
-        return new MessageViewHolder(view);
-    }
-
-    /**
-     * Fills an existing ViewHolder with data from a specific message.
-     * Called when RecyclerView wants to display or recycle a view.
-     */
-    @Override
-    public void onBindViewHolder(@NonNull MessageViewHolder holder, int position) {
-        Message message = messages.get(position);
-        holder.bind(message);
-    }
-
-    /** Returns the total number of messages in the chat */
-    @Override
-    public int getItemCount() {
-        return messages.size();
-    }
-
-    /**
-     * Returns the view type for the message at this position.
-     * RecyclerView uses this to pick the correct layout (sent vs received).
-     */
     @Override
     public int getItemViewType(int position) {
         return messages.get(position).getType();
     }
 
-    /**
-     * ViewHolder - Holds references to the views inside a message bubble.
-     *
-     * WHY VIEWHOLDERS? (for beginners)
-     * findViewById() is expensive — it searches the entire view tree.
-     * ViewHolder stores references to the views so we only call
-     * findViewById() once per view, not every time it's recycled.
-     * This makes scrolling smooth even with thousands of messages.
-     */
-    static class MessageViewHolder extends RecyclerView.ViewHolder {
-        TextView messageText;  // The actual message content
-        TextView timeText;     // Timestamp (e.g., "14:30")
-        TextView senderInfo;   // Sender name + hop count (received messages only)
+    @NonNull
+    @Override
+    public RecyclerView.ViewHolder onCreateViewHolder(@NonNull ViewGroup parent, int viewType) {
+        LayoutInflater inf = LayoutInflater.from(parent.getContext());
+        if (viewType == Message.TYPE_SENT) {
+            return new SentVH(inf.inflate(R.layout.item_message_sent, parent, false));
+        } else {
+            return new ReceivedVH(inf.inflate(R.layout.item_message_received, parent, false));
+        }
+    }
 
-        MessageViewHolder(View itemView) {
-            super(itemView);
-            messageText = itemView.findViewById(R.id.messageText);
-            timeText = itemView.findViewById(R.id.timeText);
-            senderInfo = itemView.findViewById(R.id.senderInfo);
+    @Override
+    public void onBindViewHolder(@NonNull RecyclerView.ViewHolder holder, int position) {
+        Message msg = messages.get(position);
+        if (holder instanceof SentVH) ((SentVH) holder).bind(msg);
+        else ((ReceivedVH) holder).bind(msg);
+    }
+
+    @Override
+    public int getItemCount() { return messages.size(); }
+
+    // ─── Sent ViewHolder ─────────────────────────────────────────────────
+
+    static class SentVH extends RecyclerView.ViewHolder {
+        final TextView messageText, timeText, deliveryStatus;
+
+        SentVH(View v) {
+            super(v);
+            messageText = v.findViewById(R.id.messageText);
+            timeText = v.findViewById(R.id.timeText);
+            deliveryStatus = v.findViewById(R.id.deliveryStatus);
         }
 
-        /**
-         * Binds a Message object's data to the UI views.
-         * For received messages, also shows the sender's device name
-         * and how many hops the message traveled through the mesh.
-         */
-        void bind(Message message) {
-            messageText.setText(message.getContent());
-            timeText.setText(message.getFormattedTime());
+        void bind(Message msg) {
+            messageText.setText(msg.getContent());
+            timeText.setText(msg.getFormattedTime());
 
-            // For received messages, show sender info and hop count
-            if (message.getType() == Message.TYPE_RECEIVED && senderInfo != null) {
-                // Example: "Pixel 8 · 2 hops · 🔒"
-                String info = message.getSenderName();
-                if (message.getHopCount() > 0) {
-                    info += " \u00b7 " + message.getHopCount() + " hop(s)";
+            if (deliveryStatus != null) {
+                if (msg.getChannelType() == Message.CHANNEL_PRIVATE) {
+                    deliveryStatus.setVisibility(View.VISIBLE);
+                    deliveryStatus.setText(
+                            msg.getDeliveryStatus() == Message.DELIVERY_DELIVERED ? "✓✓" : "✓");
+                } else {
+                    deliveryStatus.setVisibility(View.GONE);
                 }
-                info += " \u00b7 \ud83d\udd12"; // Lock emoji = encrypted
-                senderInfo.setText(info);
+            }
+        }
+    }
+
+    // ─── Received ViewHolder ─────────────────────────────────────────────
+
+    static class ReceivedVH extends RecyclerView.ViewHolder {
+        final TextView messageText, timeText, senderInfo;
+
+        ReceivedVH(View v) {
+            super(v);
+            messageText = v.findViewById(R.id.messageText);
+            timeText = v.findViewById(R.id.timeText);
+            senderInfo = v.findViewById(R.id.senderInfo);
+        }
+
+        void bind(Message msg) {
+            messageText.setText(msg.getContent());
+            timeText.setText(msg.getFormattedTime());
+
+            if (senderInfo != null) {
+                String hops = msg.getHopCount() > 0
+                        ? " · " + msg.getHopCount() + " hop(s)" : "";
+                senderInfo.setText(msg.getSenderName() + hops);
                 senderInfo.setVisibility(View.VISIBLE);
-            } else if (senderInfo != null) {
-                senderInfo.setVisibility(View.GONE);
             }
         }
     }

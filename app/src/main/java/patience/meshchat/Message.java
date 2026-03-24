@@ -7,160 +7,123 @@ import java.util.Locale;
 import java.util.UUID;
 
 /**
- * ============================================================================
- * Message - Represents a single chat message in the MeshChat network
- * ============================================================================
+ * Message — A single message in the MeshChat network.
  *
- * Each message travels through the mesh network from device to device.
- * Think of it like passing a note in class — the note has:
- *   - A unique ID (so we don't process the same note twice)
- *   - The message content (what was written)
- *   - Who sent it (sender info)
- *   - A timestamp (when it was written)
- *   - A hop count (how many devices have relayed it)
- *   - An encryption flag (whether the content is currently encrypted)
- *
- * IMPORTANT: This class implements Serializable because we need to
- * send Message objects over Bluetooth and WiFi streams. Serializable
- * converts the object into a stream of bytes for network transmission.
- *
- * HOP COUNT EXPLAINED:
- * ────────────────────
- * When you send a message, hopCount starts at 0.
- * When Device B receives and forwards it, hopCount becomes 1.
- * When Device C gets the forwarded message, hopCount becomes 2.
- * This continues up to MAX_HOPS (10) to prevent messages from
- * bouncing around the mesh network forever.
- *
- *   You ──→ Phone B ──→ Phone C ──→ ... ──→ Phone J (hop 9 → STOP)
- *  hop 0     hop 1       hop 2              hop 9 = MAX, won't forward
- *
- * ============================================================================
+ * Extended from the original to support:
+ *  - Private (addressed) vs broadcast messaging
+ *  - Delivery status (sent / delivered via ACK)
+ *  - Message TTL to expire stale messages
+ *  - Sub-types for handshake and ACK control frames
  */
 public class Message implements Serializable {
 
-    /**
-     * Serialization version ID.
-     * When a Message object is sent over the network, Java converts it
-     * to bytes (serialization). The receiving device converts it back
-     * (deserialization). Both sides must have the same serialVersionUID
-     * or deserialization will fail.
-     *
-     * Changed from 1 → 2 because we added the 'encrypted' field.
-     */
-    private static final long serialVersionUID = 2L;
+    private static final long serialVersionUID = 3L;
 
-    // ─── Message Fields ─────────────────────────────────────────────────
+    // ─── Sub-types ──────────────────────────────────────────────────────
+
+    /** Regular user chat message */
+    public static final int SUBTYPE_CHAT = 0;
 
     /**
-     * A globally unique identifier for this message (UUID format).
-     * Example: "550e8400-e29b-41d4-a716-446655440000"
-     *
-     * WHY? In a mesh network, the same message might reach you through
-     * multiple paths (e.g., via Phone B AND via Phone C). The UUID lets
-     * us detect and ignore duplicates — if we've seen this ID before,
-     * we skip it.
+     * Handshake — sent immediately after a connection is established.
+     * Content format: "username|nodeUUID"
+     * Used to exchange display names and UUIDs between newly connected nodes.
      */
-    private String id;
+    public static final int SUBTYPE_HANDSHAKE = 1;
 
     /**
-     * The actual text content of the message.
-     * During transit over the network, this will be AES-256 encrypted.
-     * After receiving, MeshManager decrypts it back to readable text.
+     * Acknowledgment — sent by the recipient of a private message to confirm delivery.
+     * Content: the original message's UUID.
      */
-    private String content;
+    public static final int SUBTYPE_ACK = 2;
 
-    /** Unique identifier of the sending device (Build.ID) */
-    private String senderId;
+    // ─── Channel types ──────────────────────────────────────────────────
 
-    /** Human-readable name of the sender's device (e.g., "Pixel 8", "Galaxy S24") */
-    private String senderName;
+    /** Message is broadcast to everyone in the network */
+    public static final int CHANNEL_BROADCAST = 0;
 
-    /** When the message was created, in milliseconds since Jan 1, 1970 (Unix epoch) */
-    private long timestamp;
+    /** Message is addressed to a specific node */
+    public static final int CHANNEL_PRIVATE = 1;
 
-    /**
-     * Message direction: TYPE_SENT (1) for messages WE sent,
-     * TYPE_RECEIVED (0) for messages from OTHER devices.
-     * Used by the UI to show sent messages on the right and received on the left.
-     */
-    private int type;
+    // ─── Delivery status ────────────────────────────────────────────────
 
-    /**
-     * How many times this message has been forwarded between devices.
-     * Starts at 0, incremented each time a relay node forwards it.
-     * Once it reaches MAX_HOPS, the message stops being forwarded.
-     */
-    private int hopCount;
+    /** Message has been sent (or queued) */
+    public static final int DELIVERY_SENT = 0;
 
-    /**
-     * The original sender's ID — stays the same even after forwarding.
-     * If Phone A sends a message and Phone B forwards it, the originalSenderId
-     * still points to Phone A.
-     */
-    private String originalSenderId;
+    /** Recipient has acknowledged receipt of a private message */
+    public static final int DELIVERY_DELIVERED = 1;
 
-    /**
-     * Whether the message content is currently encrypted.
-     * true = content is AES-256-GCM encrypted (during network transit)
-     * false = content is readable plaintext (after decryption / before encryption)
-     */
-    private boolean encrypted;
+    // ─── Direction ──────────────────────────────────────────────────────
 
-    // ─── Constants ──────────────────────────────────────────────────────
-
-    /** Message was received from another device in the mesh */
+    /** Message was received from another device */
     public static final int TYPE_RECEIVED = 0;
 
     /** Message was sent by the current user */
     public static final int TYPE_SENT = 1;
 
-    /**
-     * Maximum number of hops before a message is dropped.
-     * 10 hops means a message can travel through up to 10 relay devices.
-     * This prevents messages from circling forever in the mesh.
-     */
+    // ─── Hop limit ──────────────────────────────────────────────────────
+
     public static final int MAX_HOPS = 10;
+
+    // ─── Default TTL: 24 hours ──────────────────────────────────────────
+    private static final long DEFAULT_TTL_MS = 24L * 60 * 60 * 1000;
+
+    // ─── Fields ─────────────────────────────────────────────────────────
+
+    private String id;
+    private String content;
+    private String senderId;        // Sender's persistent node UUID
+    private String senderName;      // Sender's display name
+    private long timestamp;
+    private int type;               // TYPE_SENT or TYPE_RECEIVED
+    private int hopCount;
+    private String originalSenderId;
+    private boolean encrypted;
+
+    /** Recipient's node UUID. Null means broadcast to everyone. */
+    private String recipientId;
+
+    /** CHANNEL_BROADCAST or CHANNEL_PRIVATE */
+    private int channelType;
+
+    /** DELIVERY_SENT or DELIVERY_DELIVERED */
+    private int deliveryStatus;
+
+    /**
+     * Absolute expiry time in ms since epoch.
+     * Messages arriving after this time are silently discarded.
+     */
+    private long ttlMs;
+
+    /** SUBTYPE_CHAT, SUBTYPE_HANDSHAKE, or SUBTYPE_ACK */
+    private int subType;
 
     // ─── Constructors ───────────────────────────────────────────────────
 
-    /**
-     * Creates a new message for sending.
-     * Used when the current user types and sends a message.
-     *
-     * @param content The text message to send
-     * @param type    TYPE_SENT (1) for outgoing messages
-     */
+    /** Creates a new outgoing broadcast chat message */
     public Message(String content, int type) {
-        this.id = UUID.randomUUID().toString();     // Generate a globally unique ID
+        this.id = UUID.randomUUID().toString();
         this.content = content;
         this.type = type;
         this.timestamp = System.currentTimeMillis();
-        this.hopCount = 0;                           // Brand new message = zero hops
-        this.senderId = android.os.Build.ID;         // Device's build ID
-        this.senderName = android.os.Build.MODEL;    // Default; overridden by MainActivity
+        this.hopCount = 0;
+        this.senderId = android.os.Build.ID;
+        this.senderName = android.os.Build.MODEL;
         this.originalSenderId = this.senderId;
-        this.encrypted = false;                      // Not yet encrypted
+        this.encrypted = false;
+        this.recipientId = null;
+        this.channelType = CHANNEL_BROADCAST;
+        this.deliveryStatus = DELIVERY_SENT;
+        this.ttlMs = this.timestamp + DEFAULT_TTL_MS;
+        this.subType = SUBTYPE_CHAT;
     }
 
-    /**
-     * Creates a new message with a custom sender name (username).
-     * Used when the user has registered a username via RegistrationActivity.
-     */
     public Message(String content, int type, String senderName) {
         this(content, type);
         this.senderName = senderName;
     }
 
-    /**
-     * Creates a message with full details.
-     * Used when constructing a message received from another device.
-     *
-     * @param content    The message text
-     * @param senderId   The sender's device ID
-     * @param senderName The sender's device model name
-     * @param hopCount   How many hops this message has already taken
-     */
+    /** Full constructor for received messages */
     public Message(String content, String senderId, String senderName, int hopCount) {
         this.id = UUID.randomUUID().toString();
         this.content = content;
@@ -168,9 +131,54 @@ public class Message implements Serializable {
         this.senderName = senderName;
         this.timestamp = System.currentTimeMillis();
         this.hopCount = hopCount;
-        this.type = TYPE_RECEIVED;  // Messages from others are always "received"
+        this.type = TYPE_RECEIVED;
         this.originalSenderId = senderId;
         this.encrypted = false;
+        this.recipientId = null;
+        this.channelType = CHANNEL_BROADCAST;
+        this.deliveryStatus = DELIVERY_SENT;
+        this.ttlMs = this.timestamp + DEFAULT_TTL_MS;
+        this.subType = SUBTYPE_CHAT;
+    }
+
+    // ─── Factory methods ────────────────────────────────────────────────
+
+    /**
+     * Creates a handshake message to be sent immediately on connection.
+     * Content: "username|nodeUUID"
+     */
+    public static Message createHandshake(String username, String nodeId) {
+        Message m = new Message("", SUBTYPE_HANDSHAKE);
+        m.id = UUID.randomUUID().toString();
+        m.subType = SUBTYPE_HANDSHAKE;
+        m.content = username + "|" + nodeId;
+        m.senderId = nodeId;
+        m.senderName = username;
+        m.channelType = CHANNEL_BROADCAST;
+        m.encrypted = false;
+        m.ttlMs = m.timestamp + DEFAULT_TTL_MS;
+        return m;
+    }
+
+    /**
+     * Creates an ACK message confirming delivery of a private message.
+     *
+     * @param originalMsgId  The ID of the message being acknowledged
+     * @param myNodeId       Our own node UUID (to set as senderId)
+     * @param senderNodeId   The original sender's UUID (to route the ACK back)
+     */
+    public static Message createAck(String originalMsgId, String myNodeId,
+                                    String senderNodeId) {
+        Message m = new Message("", TYPE_SENT);
+        m.id = UUID.randomUUID().toString();
+        m.subType = SUBTYPE_ACK;
+        m.content = originalMsgId;
+        m.senderId = myNodeId;
+        m.recipientId = senderNodeId;
+        m.channelType = CHANNEL_PRIVATE;
+        m.encrypted = false;
+        m.ttlMs = m.timestamp + DEFAULT_TTL_MS;
+        return m;
     }
 
     // ─── Getters ────────────────────────────────────────────────────────
@@ -184,96 +192,54 @@ public class Message implements Serializable {
     public int getHopCount() { return hopCount; }
     public String getOriginalSenderId() { return originalSenderId; }
     public boolean isEncrypted() { return encrypted; }
+    public String getRecipientId() { return recipientId; }
+    public int getChannelType() { return channelType; }
+    public int getDeliveryStatus() { return deliveryStatus; }
+    public long getTtlMs() { return ttlMs; }
+    public int getSubType() { return subType; }
 
     // ─── Setters ────────────────────────────────────────────────────────
 
-    /**
-     * Updates the message content text.
-     * Used by MeshManager after decrypting to replace encrypted gibberish
-     * with the original readable text.
-     *
-     * @param content The new content (usually the decrypted plaintext)
-     */
-    public void setContent(String content) {
-        this.content = content;
+    public void setContent(String content) { this.content = content; }
+    public void setType(int type) { this.type = type; }
+    public void setEncrypted(boolean encrypted) { this.encrypted = encrypted; }
+    public void setSenderName(String senderName) { this.senderName = senderName; }
+    public void setSenderId(String senderId) { this.senderId = senderId; }
+    public void setOriginalSenderId(String id) { this.originalSenderId = id; }
+    public void setRecipientId(String recipientId) { this.recipientId = recipientId; }
+    public void setChannelType(int channelType) { this.channelType = channelType; }
+    public void setDeliveryStatus(int status) { this.deliveryStatus = status; }
+
+    // ─── Mesh helpers ───────────────────────────────────────────────────
+
+    public void incrementHopCount() { this.hopCount++; }
+    public boolean canForward() { return hopCount < MAX_HOPS; }
+    public boolean isExpired() { return System.currentTimeMillis() > ttlMs; }
+
+    /** Whether this is a control frame (handshake or ACK) rather than user content */
+    public boolean isControlFrame() {
+        return subType == SUBTYPE_HANDSHAKE || subType == SUBTYPE_ACK;
     }
 
-    /**
-     * Sets the message direction type.
-     * Used when a relayed message arrives — we set it to TYPE_RECEIVED
-     * so the UI displays it on the left side (incoming message style).
-     *
-     * @param type TYPE_SENT (1) or TYPE_RECEIVED (0)
-     */
-    public void setType(int type) {
-        this.type = type;
-    }
-
-    /**
-     * Sets whether the content is currently encrypted.
-     *
-     * @param encrypted true if content is encrypted, false if plaintext
-     */
-    public void setEncrypted(boolean encrypted) {
-        this.encrypted = encrypted;
-    }
-
-    public void setSenderName(String senderName) {
-        this.senderName = senderName;
-    }
-
-    // ─── Mesh Networking Methods ────────────────────────────────────────
-
-    /**
-     * Increments the hop count by 1.
-     * Called each time a relay node forwards this message to the next device.
-     */
-    public void incrementHopCount() {
-        this.hopCount++;
-    }
-
-    /**
-     * Checks if this message is allowed to be forwarded further.
-     *
-     * Returns false once the hop count reaches MAX_HOPS, which prevents
-     * messages from bouncing endlessly around the mesh network.
-     *
-     * @return true if hopCount < MAX_HOPS (message can still travel further)
-     */
-    public boolean canForward() {
-        return hopCount < MAX_HOPS;
-    }
-
-    /**
-     * Formats the timestamp into a human-readable time (e.g., "14:30").
-     * Used in the chat UI next to each message bubble.
-     *
-     * @return Time string in HH:mm format
-     */
     public String getFormattedTime() {
         SimpleDateFormat sdf = new SimpleDateFormat("HH:mm", Locale.getDefault());
         return sdf.format(new Date(timestamp));
     }
 
-    /**
-     * Creates an independent copy of this message.
-     *
-     * WHY? When we encrypt a message for network transmission, we don't
-     * want to modify the original message that's displayed in the UI.
-     * So we create a copy, encrypt the copy, and send the copy over
-     * the network — the original stays readable on screen.
-     *
-     * @return A new Message object with identical field values
-     */
     public Message copy() {
         Message clone = new Message(this.content, this.type);
-        clone.id = this.id;                           // Same ID for deduplication
+        clone.id = this.id;
         clone.senderId = this.senderId;
         clone.senderName = this.senderName;
         clone.timestamp = this.timestamp;
         clone.hopCount = this.hopCount;
         clone.originalSenderId = this.originalSenderId;
         clone.encrypted = this.encrypted;
+        clone.recipientId = this.recipientId;
+        clone.channelType = this.channelType;
+        clone.deliveryStatus = this.deliveryStatus;
+        clone.ttlMs = this.ttlMs;
+        clone.subType = this.subType;
         return clone;
     }
 }

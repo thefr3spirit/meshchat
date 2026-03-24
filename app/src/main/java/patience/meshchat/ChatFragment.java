@@ -1,10 +1,11 @@
 package patience.meshchat;
 
-import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
 import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
+import android.widget.EditText;
+import android.widget.ImageButton;
 import android.widget.TextView;
 
 import androidx.annotation.NonNull;
@@ -13,50 +14,69 @@ import androidx.fragment.app.Fragment;
 import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 
-import com.google.android.material.bottomsheet.BottomSheetDialog;
-import com.google.android.material.button.MaterialButton;
 import com.google.android.material.snackbar.Snackbar;
 
 import java.util.ArrayList;
 import java.util.List;
 
 /**
- * ChatFragment — the main messaging screen.
+ * ChatFragment — the actual messaging screen for a single conversation.
  *
- * Extracted from the original monolithic MainActivity so the app can
- * use a bottom navigation bar with multiple tabs.
+ * Works for both the group/broadcast channel and private one-on-one threads.
+ * Receives a {@link Conversation} via Bundle arguments.
  *
- * This fragment handles:
- *  - Displaying the message list (RecyclerView)
- *  - Sending messages through MeshManager
- *  - Visibility toggle (Visible / Hidden)
- *  - Peer discovery (Scan → BottomSheetDialog with peer list)
- *  - Status bar updates (connected node count, queued messages)
- *
- * It accesses MeshService through the parent Activity:
- *   ((MainActivity) requireActivity()).getMeshService()
+ * KEY CHANGES from original:
+ *  - No scan button or visibility toggle (auto-managed)
+ *  - Header shows conversation name (peer username or "Group Chat")
+ *  - Routes via broadcastMessage (group) or sendPrivateMessage (private)
+ *  - Delivery receipts (✓ sent / ✓✓ delivered) for private messages
+ *  - Reads only messages belonging to this conversation
  */
 public class ChatFragment extends Fragment {
 
+    // Bundle argument keys
+    public static final String ARG_CONV_ID = "conv_id";
+    public static final String ARG_CONV_NAME = "conv_name";
+    public static final String ARG_IS_GROUP = "is_group";
+    public static final String ARG_PEER_ID = "peer_id";
+
+    private RecyclerView recyclerMessages;
+    private EditText messageInput;
+    private ImageButton sendButton;
+    private TextView convTitle, statusText;
+    private View backButton;
+
     private MessageAdapter messageAdapter;
-    private ArrayList<Message> messages = new ArrayList<>();
+    private final List<Message> messages = new ArrayList<>();
 
-    // ─── UI Elements ────────────────────────────────────────
-    private RecyclerView recyclerView;
-    private android.widget.EditText messageInput;
-    private View sendButton;
-    private TextView connectionStatus;
-    private View statusDot;
-    private MaterialButton scanButton;
-    private MaterialButton visibilityToggle;
+    private String conversationId;
+    private String conversationName;
+    private boolean isGroup;
+    private String peerId; // peer's node UUID (null for group)
 
-    /** Whether user is currently visible to mesh */
-    private boolean isVisible = true;
+    // ─── Factory ────────────────────────────────────────────────────────
 
-    /** Peer list for the scan bottom sheet */
-    private List<PeerAdapter.PeerInfo> discoveredPeers = new ArrayList<>();
-    private PeerAdapter peerAdapter;
-    private BottomSheetDialog peerDialog;
+    public static ChatFragment newInstance(Conversation conv) {
+        ChatFragment f = new ChatFragment();
+        Bundle args = new Bundle();
+        args.putString(ARG_CONV_ID, conv.id);
+        args.putString(ARG_CONV_NAME, conv.name);
+        args.putBoolean(ARG_IS_GROUP, conv.isGroup);
+        args.putString(ARG_PEER_ID, conv.peerId);
+        f.setArguments(args);
+        return f;
+    }
+
+    @Override
+    public void onCreate(@Nullable Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        if (getArguments() != null) {
+            conversationId = getArguments().getString(ARG_CONV_ID);
+            conversationName = getArguments().getString(ARG_CONV_NAME, "Chat");
+            isGroup = getArguments().getBoolean(ARG_IS_GROUP, true);
+            peerId = getArguments().getString(ARG_PEER_ID);
+        }
+    }
 
     @Nullable
     @Override
@@ -69,296 +89,222 @@ public class ChatFragment extends Fragment {
     @Override
     public void onViewCreated(@NonNull View view, @Nullable Bundle savedInstanceState) {
         super.onViewCreated(view, savedInstanceState);
-        initializeViews(view);
-        setupRecyclerView();
+
+        recyclerMessages = view.findViewById(R.id.recyclerMessages);
+        messageInput = view.findViewById(R.id.messageInput);
+        sendButton = view.findViewById(R.id.sendButton);
+        convTitle = view.findViewById(R.id.convTitle);
+        statusText = view.findViewById(R.id.connectionStatus);
+        backButton = view.findViewById(R.id.backButton);
+
+        convTitle.setText(conversationName);
+
+        LinearLayoutManager lm = new LinearLayoutManager(requireContext());
+        lm.setStackFromEnd(true);
+        messageAdapter = new MessageAdapter(messages);
+        recyclerMessages.setLayoutManager(lm);
+        recyclerMessages.setAdapter(messageAdapter);
+
+        sendButton.setOnClickListener(v -> sendMessage());
+        if (backButton != null) {
+            backButton.setOnClickListener(v -> requireActivity().onBackPressed());
+        }
+
+        // Load existing messages from MainActivity's store
+        loadExistingMessages();
+
+        updateStatus();
     }
 
     @Override
     public void onResume() {
         super.onResume();
-        // Re-register the mesh listener whenever we become the active tab
         setupMeshListener();
     }
 
-    // ─── View initialization ────────────────────────────────
+    // ─── Load existing messages ──────────────────────────────────────────
 
-    private void initializeViews(View view) {
-        recyclerView = view.findViewById(R.id.recyclerMessages);
-        messageInput = view.findViewById(R.id.messageInput);
-        sendButton = view.findViewById(R.id.sendButton);
-        connectionStatus = view.findViewById(R.id.connectionStatus);
-        statusDot = view.findViewById(R.id.statusDot);
-        scanButton = view.findViewById(R.id.scanButton);
-        visibilityToggle = view.findViewById(R.id.visibilityToggle);
-
-        sendButton.setOnClickListener(v -> sendMessage());
-        scanButton.setOnClickListener(v -> startScanning());
-        visibilityToggle.setOnClickListener(v -> toggleVisibility());
-    }
-
-    private void setupRecyclerView() {
-        messageAdapter = new MessageAdapter(messages);
-        LinearLayoutManager lm = new LinearLayoutManager(requireContext());
-        lm.setStackFromEnd(true);
-        recyclerView.setLayoutManager(lm);
-        recyclerView.setAdapter(messageAdapter);
-    }
-
-    // ─── Access the MeshService through parent Activity ─────
-
-    private MeshService getMeshService() {
-        MainActivity activity = (MainActivity) requireActivity();
-        return activity.getMeshService();
-    }
-
-    private boolean isServiceBound() {
-        MainActivity activity = (MainActivity) requireActivity();
-        return activity.isServiceBound();
-    }
-
-    // ─── Visibility Toggle ──────────────────────────────────
-
-    private void toggleVisibility() {
-        isVisible = !isVisible;
-
-        MeshService service = getMeshService();
-        if (isServiceBound() && service != null && service.getMeshManager() != null) {
-            service.getMeshManager().setVisible(isVisible);
-        }
-
-        if (isVisible) {
-            visibilityToggle.setText(R.string.visible);
-            visibilityToggle.setIconResource(android.R.drawable.presence_online);
-            visibilityToggle.setIconTintResource(R.color.statusOnline);
-            showSnackbar(getString(R.string.visibility_on));
-        } else {
-            visibilityToggle.setText(R.string.hidden);
-            visibilityToggle.setIconResource(android.R.drawable.presence_invisible);
-            visibilityToggle.setIconTintResource(R.color.statusOffline);
-            showSnackbar(getString(R.string.visibility_off));
-        }
-    }
-
-    // ─── Peer Discovery / Scan ──────────────────────────────
-
-    private void startScanning() {
-        MeshService service = getMeshService();
-        if (!isServiceBound() || service == null || service.getMeshManager() == null) {
-            showSnackbar("Mesh service not ready. Please wait...");
-            return;
-        }
-
-        service.getMeshManager().startDiscovery();
-        showPeerDialog();
-    }
-
-    private void showPeerDialog() {
-        peerDialog = new BottomSheetDialog(requireContext());
-        View dialogView = LayoutInflater.from(requireContext())
-                .inflate(R.layout.dialog_peer_list, null);
-
-        RecyclerView peerRecycler = dialogView.findViewById(R.id.peerRecycler);
-        View scanningIndicator = dialogView.findViewById(R.id.scanningIndicator);
-        TextView emptyState = dialogView.findViewById(R.id.emptyState);
-
-        discoveredPeers = new ArrayList<>();
-        MeshService service = getMeshService();
-        if (isServiceBound() && service != null && service.getMeshManager() != null) {
-            discoveredPeers.addAll(service.getMeshManager().getDiscoveredPeers());
-        }
-
-        peerAdapter = new PeerAdapter(discoveredPeers, peer -> {
-            if (isServiceBound() && getMeshService() != null
-                    && getMeshService().getMeshManager() != null) {
-                getMeshService().getMeshManager().connectToPeer(peer);
-                showSnackbar(String.format(getString(R.string.connecting_to), peer.name));
+    private void loadExistingMessages() {
+        if (getActivity() instanceof MainActivity) {
+            List<Message> existing =
+                    ((MainActivity) requireActivity()).getMessagesForConversation(conversationId);
+            messages.clear();
+            messages.addAll(existing);
+            messageAdapter.notifyDataSetChanged();
+            if (!messages.isEmpty()) {
+                recyclerMessages.scrollToPosition(messages.size() - 1);
             }
-        });
-
-        peerRecycler.setLayoutManager(new LinearLayoutManager(requireContext()));
-        peerRecycler.setAdapter(peerAdapter);
-
-        if (discoveredPeers.isEmpty()) {
-            emptyState.setVisibility(View.GONE);
         }
-
-        // Hide scanning indicator after scan completes (~12s)
-        peerRecycler.postDelayed(() -> {
-            scanningIndicator.setVisibility(View.GONE);
-            if (discoveredPeers.isEmpty()) {
-                emptyState.setVisibility(View.VISIBLE);
-            }
-        }, 13000);
-
-        peerDialog.setContentView(dialogView);
-        peerDialog.show();
     }
 
-    // ─── Mesh Listener ──────────────────────────────────────
+    // ─── Mesh listener ──────────────────────────────────────────────────
 
-    /**
-     * Registers this fragment as the MeshManager's message listener.
-     * When user switches to a different tab, onPause() fires but we
-     * don't remove the listener — messages still accumulate in the list.
-     */
     public void setupMeshListener() {
-        MeshService service = getMeshService();
-        if (service == null || service.getMeshManager() == null) return;
+        MeshService svc = getService();
+        if (svc == null || svc.getMeshManager() == null) return;
 
-        String username = requireActivity().getSharedPreferences(
-                RegistrationActivity.PREFS_NAME,
-                requireContext().MODE_PRIVATE
-        ).getString(RegistrationActivity.KEY_USERNAME, "Unknown");
+        String myUsername = requireActivity()
+                .getSharedPreferences(RegistrationActivity.PREFS_NAME,
+                        requireContext().MODE_PRIVATE)
+                .getString(RegistrationActivity.KEY_USERNAME, "Unknown");
 
-        service.getMeshManager().setMessageListener(new MeshManager.MessageListener() {
+        svc.getMeshManager().setMessageListener(new MeshManager.MessageListener() {
             @Override
             public void onMessageReceived(Message message) {
                 if (getActivity() == null) return;
-                getActivity().runOnUiThread(() -> {
-                    messages.add(message);
-                    messageAdapter.notifyItemInserted(messages.size() - 1);
-                    recyclerView.smoothScrollToPosition(messages.size() - 1);
-                });
+                // Only show messages relevant to this conversation
+                if (!isRelevant(message)) {
+                    // Still dispatch to MainActivity for other conversations
+                    ((MainActivity) requireActivity()).dispatchMessage(message);
+                    return;
+                }
+                getActivity().runOnUiThread(() -> addMessage(message));
             }
 
             @Override
-            public void onNodeConnected(String nodeId) {
-                updateStatus();
+            public void onNodeInfoUpdated(List<NodeInfo> nodes) {
+                if (getActivity() != null) getActivity().runOnUiThread(() -> updateStatus());
+            }
+
+            @Override
+            public void onNetworkDiscovered(List<Network> networks) {}
+
+            @Override
+            public void onQueueFlushed(int count) {
                 if (getActivity() != null) {
                     getActivity().runOnUiThread(() ->
-                        showSnackbar(String.format(getString(R.string.connected_to), nodeId)));
+                            showSnackbar(count + " queued message(s) delivered"));
                 }
             }
 
             @Override
-            public void onNodeDisconnected(String nodeId) {
-                updateStatus();
-                if (getActivity() != null) {
-                    getActivity().runOnUiThread(() ->
-                        showSnackbar(String.format(getString(R.string.disconnected_from), nodeId)));
-                }
-            }
-
-            @Override
-            public void onQueueFlushed(int messageCount) {
-                if (getActivity() != null) {
-                    getActivity().runOnUiThread(() ->
-                        showSnackbar(String.format(getString(R.string.queue_flushed), messageCount)));
-                }
-            }
-
-            @Override
-            public void onPeerDiscovered(List<PeerAdapter.PeerInfo> peers) {
+            public void onDeliveryStatusChanged(String messageId) {
                 if (getActivity() == null) return;
                 getActivity().runOnUiThread(() -> {
-                    if (peerAdapter != null && peerDialog != null && peerDialog.isShowing()) {
-                        discoveredPeers.clear();
-                        discoveredPeers.addAll(peers);
-                        peerAdapter.notifyDataSetChanged();
-
-                        View dialogView = peerDialog.findViewById(R.id.emptyState);
-                        if (dialogView != null) {
-                            dialogView.setVisibility(
-                                    peers.isEmpty() ? View.VISIBLE : View.GONE);
+                    ((MainActivity) requireActivity()).handleDeliveryStatus(messageId);
+                    // Update delivery indicator in this chat
+                    for (int i = 0; i < messages.size(); i++) {
+                        if (messages.get(i).getId().equals(messageId)) {
+                            messages.get(i).setDeliveryStatus(Message.DELIVERY_DELIVERED);
+                            messageAdapter.notifyItemChanged(i);
+                            break;
                         }
                     }
                 });
             }
 
             @Override
-            public void onScanComplete(int peerCount) {
-                if (getActivity() == null) return;
-                getActivity().runOnUiThread(() -> {
-                    if (peerCount == 0 && peerDialog != null && peerDialog.isShowing()) {
-                        View empty = peerDialog.findViewById(R.id.emptyState);
-                        View scanning = peerDialog.findViewById(R.id.scanningIndicator);
-                        if (empty != null) empty.setVisibility(View.VISIBLE);
-                        if (scanning != null) scanning.setVisibility(View.GONE);
-                    }
-                });
+            public void onNetworkJoined(String networkName) {}
+
+            @Override
+            public void onNetworkLeft() {
+                if (getActivity() != null) {
+                    getActivity().runOnUiThread(() ->
+                            ((MainActivity) requireActivity()).showDiscoveryScreen());
+                }
             }
         });
+
         updateStatus();
     }
 
-    // ─── Status Updates ─────────────────────────────────────
-
-    private void updateStatus() {
-        if (getActivity() == null) return;
-        getActivity().runOnUiThread(() -> {
-            MeshService service = getMeshService();
-            if (service == null || service.getMeshManager() == null) return;
-
-            int nodeCount = service.getMeshManager().getConnectedNodeCount();
-            int queuedCount = service.getMeshManager().getQueuedMessageCount();
-
-            String status;
-            if (queuedCount > 0) {
-                status = String.format(getString(R.string.mesh_status_queued),
-                        nodeCount, queuedCount);
-            } else {
-                status = String.format(getString(R.string.mesh_status), nodeCount);
-            }
-            connectionStatus.setText(status);
-
-            // Update status dot color
-            GradientDrawable dot = (GradientDrawable) statusDot.getBackground();
-            if (nodeCount > 0) {
-                dot.setColor(requireContext().getColor(R.color.statusOnline));
-            } else {
-                dot.setColor(requireContext().getColor(R.color.statusOffline));
-            }
-        });
+    /**
+     * Returns true if this message belongs to the currently displayed conversation.
+     *
+     * For group: message must be a broadcast
+     * For private: message must be from or to the peer in this conversation
+     */
+    private boolean isRelevant(Message msg) {
+        if (isGroup) {
+            return msg.getChannelType() == Message.CHANNEL_BROADCAST;
+        } else {
+            // Private: from peer to us, or control frames for this conversation
+            return peerId != null && peerId.equals(msg.getSenderId());
+        }
     }
 
-    // ─── Messaging ──────────────────────────────────────────
+    private void addMessage(Message message) {
+        messages.add(message);
+        messageAdapter.notifyItemInserted(messages.size() - 1);
+        recyclerMessages.smoothScrollToPosition(messages.size() - 1);
+        // Also store in MainActivity
+        if (getActivity() instanceof MainActivity) {
+            ((MainActivity) requireActivity()).storeMessage(conversationId, message);
+        }
+    }
+
+    // ─── Sending ────────────────────────────────────────────────────────
 
     private void sendMessage() {
-        String content = messageInput.getText().toString().trim();
-        if (content.isEmpty()) return;
+        String text = messageInput.getText().toString().trim();
+        if (text.isEmpty()) return;
 
-        MeshService service = getMeshService();
-        if (!isServiceBound() || service == null || service.getMeshManager() == null) {
-            showSnackbar("Mesh service not ready. Please wait...");
+        MeshService svc = getService();
+        if (svc == null || svc.getMeshManager() == null) {
+            showSnackbar("Mesh service not ready");
             return;
         }
 
-        // Get current username from SharedPreferences
-        String username = requireActivity().getSharedPreferences(
-                RegistrationActivity.PREFS_NAME,
-                requireContext().MODE_PRIVATE
-        ).getString(RegistrationActivity.KEY_USERNAME, "Unknown");
+        String username = requireActivity()
+                .getSharedPreferences(RegistrationActivity.PREFS_NAME,
+                        requireContext().MODE_PRIVATE)
+                .getString(RegistrationActivity.KEY_USERNAME, "Unknown");
 
-        Message message = new Message(content, Message.TYPE_SENT, username);
+        Message message = new Message(text, Message.TYPE_SENT, username);
 
+        // Add to local display immediately
         messages.add(message);
         messageAdapter.notifyItemInserted(messages.size() - 1);
-        recyclerView.smoothScrollToPosition(messages.size() - 1);
-
-        service.getMeshManager().broadcastMessage(message);
+        recyclerMessages.smoothScrollToPosition(messages.size() - 1);
         messageInput.setText("");
 
-        if (service.getMeshManager().getConnectedNodeCount() == 0) {
-            showSnackbar(getString(R.string.no_peers));
+        // Store in MainActivity
+        if (getActivity() instanceof MainActivity) {
+            ((MainActivity) requireActivity()).storeMessage(conversationId, message);
+            ((MainActivity) requireActivity()).updateConversationPreview(
+                    conversationId, conversationName, isGroup, text);
+        }
+
+        // Route appropriately
+        if (isGroup) {
+            svc.getMeshManager().broadcastMessage(message);
+        } else {
+            svc.getMeshManager().sendPrivateMessage(message, peerId);
         }
 
         updateStatus();
     }
 
-    // ─── Snackbar ───────────────────────────────────────────
+    // ─── Status bar ─────────────────────────────────────────────────────
 
-    private void showSnackbar(String text) {
-        View view = getView();
-        if (view != null) {
-            Snackbar.make(view, text, Snackbar.LENGTH_SHORT).show();
-        }
+    private void updateStatus() {
+        if (getActivity() == null || statusText == null) return;
+        getActivity().runOnUiThread(() -> {
+            MeshService svc = getService();
+            if (svc == null || svc.getMeshManager() == null) return;
+            int nodes = svc.getMeshManager().getConnectedNodeCount();
+            int queued = svc.getMeshManager().getQueuedMessageCount();
+            if (queued > 0) {
+                statusText.setText(nodes + " peer(s) · " + queued + " queued");
+            } else if (nodes > 0) {
+                statusText.setText(nodes + " peer(s) connected");
+            } else {
+                statusText.setText(R.string.no_devices_found);
+            }
+        });
     }
 
-    @Override
-    public void onDestroyView() {
-        super.onDestroyView();
-        if (peerDialog != null && peerDialog.isShowing()) {
-            peerDialog.dismiss();
+    // ─── Helpers ─────────────────────────────────────────────────────────
+
+    private MeshService getService() {
+        if (getActivity() instanceof MainActivity) {
+            return ((MainActivity) getActivity()).getMeshService();
         }
+        return null;
+    }
+
+    private void showSnackbar(String msg) {
+        View v = getView();
+        if (v != null) Snackbar.make(v, msg, Snackbar.LENGTH_SHORT).show();
     }
 }

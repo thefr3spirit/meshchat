@@ -14,30 +14,35 @@ import com.google.android.material.button.MaterialButton;
 import java.util.List;
 
 /**
- * PeerAdapter - RecyclerView adapter for displaying discovered mesh peers.
- *
- * Each item shows the device name, address, connection status, and a
- * connect button. Connected devices show a green dot; available devices
- * show an orange dot.
+ * PeerAdapter — RecyclerView adapter for discovered Bluetooth peers.
+ * Used in NetworkDiscoveryFragment's bottom sheet to show devices found
+ * in the same mesh network during an active scan.
  */
 public class PeerAdapter extends RecyclerView.Adapter<PeerAdapter.PeerViewHolder> {
 
-    /** Data class representing a discovered peer */
+    /** Data class representing a discovered Bluetooth peer */
     public static class PeerInfo {
         public final String name;
         public final String address;
         public final boolean isConnected;
-        public final String type; // "bluetooth" or "wifi"
+        public final String type;   // always "bluetooth" now
+        public final int rssi;      // signal strength in dBm
 
-        public PeerInfo(String name, String address, boolean isConnected, String type) {
+        public PeerInfo(String name, String address, boolean isConnected,
+                        String type, int rssi) {
             this.name = name;
             this.address = address;
             this.isConnected = isConnected;
             this.type = type;
+            this.rssi = rssi;
+        }
+
+        /** Legacy constructor without RSSI */
+        public PeerInfo(String name, String address, boolean isConnected, String type) {
+            this(name, address, isConnected, type, Integer.MIN_VALUE);
         }
     }
 
-    /** Callback when user taps "Connect" on a peer */
     public interface OnPeerClickListener {
         void onConnectClicked(PeerInfo peer);
     }
@@ -64,9 +69,7 @@ public class PeerAdapter extends RecyclerView.Adapter<PeerAdapter.PeerViewHolder
     }
 
     @Override
-    public int getItemCount() {
-        return peers.size();
-    }
+    public int getItemCount() { return peers.size(); }
 
     class PeerViewHolder extends RecyclerView.ViewHolder {
         private final TextView peerName;
@@ -83,21 +86,18 @@ public class PeerAdapter extends RecyclerView.Adapter<PeerAdapter.PeerViewHolder
         }
 
         void bind(PeerInfo peer) {
-            // Clean up the name: strip "MeshChat_" prefix if present
             String displayName = peer.name;
-            if (displayName != null && displayName.startsWith("MeshChat_")) {
+            if (displayName != null && displayName.startsWith("MC_")) {
+                displayName = displayName.substring(3);
+            } else if (displayName != null && displayName.startsWith("MeshChat_")) {
                 displayName = displayName.substring("MeshChat_".length());
             }
-            if (displayName == null || displayName.isEmpty()) {
-                displayName = "Unknown Device";
-            }
+            if (displayName == null || displayName.isEmpty()) displayName = "Unknown Device";
             peerName.setText(displayName);
 
-            // Show address and transport type
-            String typeLabel = "wifi".equals(peer.type) ? "WiFi Direct" : "Bluetooth";
-            peerAddress.setText(peer.address + " · " + typeLabel);
+            String rssiLabel = peer.rssi != Integer.MIN_VALUE ? peer.rssi + " dBm" : "";
+            peerAddress.setText(peer.address + (rssiLabel.isEmpty() ? "" : " · " + rssiLabel));
 
-            // Status dot color
             GradientDrawable dot = (GradientDrawable) statusDot.getBackground();
             if (peer.isConnected) {
                 dot.setColor(itemView.getContext().getColor(R.color.peerConnected));
@@ -110,16 +110,10 @@ public class PeerAdapter extends RecyclerView.Adapter<PeerAdapter.PeerViewHolder
             }
 
             connectButton.setOnClickListener(v -> {
-                if (listener != null && !peer.isConnected) {
-                    listener.onConnectClicked(peer);
-                }
+                if (listener != null && !peer.isConnected) listener.onConnectClicked(peer);
             });
-
-            // Allow tapping the whole card too
             itemView.setOnClickListener(v -> {
-                if (listener != null && !peer.isConnected) {
-                    listener.onConnectClicked(peer);
-                }
+                if (listener != null && !peer.isConnected) listener.onConnectClicked(peer);
             });
         }
     }
