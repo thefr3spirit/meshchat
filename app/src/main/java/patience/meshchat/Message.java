@@ -52,6 +52,21 @@ public class Message implements Serializable {
      */
     public static final int SUBTYPE_KEY_ANNOUNCE = 4;
 
+    /**
+     * Bloom Filter — periodic anti-entropy advertisement.
+     * Content: Base64-encoded Bloom filter of received message IDs.
+     * Peers compare against their own set and push missing messages.
+     */
+    public static final int SUBTYPE_BLOOM_FILTER = 5;
+
+    /**
+     * Message Request — sent when a peer detects missing messages
+     * from a Bloom filter comparison.
+     * Content: comma-separated list of message IDs that the sender has
+     *          but the recipient appears to be missing.
+     */
+    public static final int SUBTYPE_MESSAGE_REQUEST = 6;
+
     // ─── Channel types ──────────────────────────────────────────────────
 
     /** Message is broadcast to everyone in the network */
@@ -249,6 +264,7 @@ public class Message implements Serializable {
     public int getDeliveryStatus() { return deliveryStatus; }
     public long getTtlMs() { return ttlMs; }
     public int getSubType() { return subType; }
+    public void setSubType(int subType) { this.subType = subType; }
 
     // ─── Setters ────────────────────────────────────────────────────────
 
@@ -268,10 +284,11 @@ public class Message implements Serializable {
     public boolean canForward() { return hopCount < MAX_HOPS; }
     public boolean isExpired() { return System.currentTimeMillis() > ttlMs; }
 
-    /** Whether this is a control frame (handshake, ACK, heartbeat, or key announce) rather than user content */
+    /** Whether this is a control frame (handshake, ACK, heartbeat, key announce, bloom, or msg request) rather than user content */
     public boolean isControlFrame() {
         return subType == SUBTYPE_HANDSHAKE || subType == SUBTYPE_ACK
-                || subType == SUBTYPE_HEARTBEAT || subType == SUBTYPE_KEY_ANNOUNCE;
+                || subType == SUBTYPE_HEARTBEAT || subType == SUBTYPE_KEY_ANNOUNCE
+                || subType == SUBTYPE_BLOOM_FILTER || subType == SUBTYPE_MESSAGE_REQUEST;
     }
 
     public String getFormattedTime() {

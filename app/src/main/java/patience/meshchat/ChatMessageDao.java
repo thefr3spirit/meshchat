@@ -38,4 +38,12 @@ public interface ChatMessageDao {
     /** Delete all messages for a conversation */
     @Query("DELETE FROM chat_messages WHERE conversation_id = :conversationId")
     void deleteConversation(String conversationId);
+
+    /** Get all message IDs (for Bloom filter population on startup) */
+    @Query("SELECT message_id FROM chat_messages")
+    List<String> getAllMessageIds();
+
+    /** Get a single message by ID (for anti-entropy push) */
+    @Query("SELECT * FROM chat_messages WHERE message_id = :messageId")
+    ChatMessageEntity getMessageById(String messageId);
 }
