@@ -57,6 +57,7 @@ import java.util.concurrent.TimeUnit;
  *  7. DISTANCE CONTROL  — RSSI threshold determines whether to auto-connect
  *  8. WIFI DIRECT       — Group Owner discovery and group formation
  *  9. BLE ADVERTISING   — Dead-zone discovery via BLE ads + WiFi Direct handoff
+ * 10. STORE & FORWARD   — Room-persisted queue with BLE-triggered redelivery
  *
  * NETWORK NAMING:
  * ──────────────
@@ -173,6 +174,11 @@ public class MeshManager {
 
     /** BLE advertiser/scanner for dead-zone peer discovery */
     private BleAdvertiser bleAdvertiser;
+
+    // ─── Store & Forward (Room-persisted queue) ─────────────────────
+
+    /** Persistent message queue — survives app restarts and process death */
+    private StoreAndForwardManager storeAndForwardManager;
 
     /** Our WiFi Direct MAC address (learned when this device info changes) */
     private volatile String myWifiDirectMac;
@@ -351,6 +357,8 @@ public class MeshManager {
         this.rssiThreshold = prefs.getInt(KEY_RSSI_THRESHOLD, DEFAULT_RSSI_THRESHOLD);
         this.cryptoManager = new CryptoManager(DEFAULT_PASSPHRASE);
         this.e2eCryptoManager = new E2ECryptoManager(context);
+        this.storeAndForwardManager = new StoreAndForwardManager(context);
+        this.storeAndForwardManager.setDeliveryCallback(this::deliverStoredMessage);
 
         initialize();
     }
@@ -435,6 +443,10 @@ public class MeshManager {
         // Skip if it's our own advertisement or already connected
         if (wifiDirectMac.equals(myWifiDirectMac)) return;
         if (wifiDirectConnectedNodes.contains(wifiDirectMac)) return;
+
+        // Check if we have queued messages for this peer — attempt delivery
+        // once the WiFi Direct connection is established (via notifyNodeConnected)
+        storeAndForwardManager.attemptDelivery(wifiDirectMac);
 
         // Initiate WiFi Direct connection to the BLE-discovered peer
         connectWifiDirectPeer(wifiDirectMac);
@@ -1121,10 +1133,12 @@ public class MeshManager {
             // Relay through mesh (Bluetooth + WiFi Direct)
             sendToAllPeers(networkCopy, null);
         } else {
-            // No peers — queue for when they connect
+            // No peers — queue in-memory and persist to Room for redelivery
             perRecipientQueue
                     .computeIfAbsent(recipientId, k -> new ConcurrentLinkedQueue<>())
                     .add(networkCopy);
+            // Also persist to Room (survives process death)
+            storeAndForwardManager.enqueue(networkCopy, recipientId, recipientId);
         }
     }
 
@@ -1145,13 +1159,17 @@ public class MeshManager {
         for (Map.Entry<String, ObjectOutputStream> entry : bluetoothOutputStreams.entrySet()) {
             String mac = entry.getKey();
             if (mac.equals(excludeAddress)) continue;
-            writeToStream(entry.getValue(), message, mac);
+            if (!writeToStream(entry.getValue(), message, mac)) {
+                queueForStoreAndForward(message, mac);
+            }
         }
         // WiFi Direct transport
         for (Map.Entry<String, ObjectOutputStream> entry : wifiDirectOutputStreams.entrySet()) {
             String addr = entry.getKey();
             if (addr.equals(excludeAddress)) continue;
-            writeToStream(entry.getValue(), message, addr);
+            if (!writeToStream(entry.getValue(), message, addr)) {
+                queueForStoreAndForward(message, addr);
+            }
         }
     }
 
@@ -1160,21 +1178,59 @@ public class MeshManager {
         ObjectOutputStream out = bluetoothOutputStreams.get(mac);
         if (out == null) out = wifiDirectOutputStreams.get(mac);
         if (out != null) {
-            writeToStream(out, message, mac);
+            if (!writeToStream(out, message, mac)) {
+                // Write failed — queue for store-and-forward redelivery
+                queueForStoreAndForward(message, mac);
+            }
+        } else {
+            // No stream available — queue for store-and-forward redelivery
+            queueForStoreAndForward(message, mac);
         }
     }
 
-    private void writeToStream(ObjectOutputStream out, Message message, String nodeId) {
+    /**
+     * Writes a message to an output stream.
+     *
+     * @return true if the write succeeded, false if it failed
+     */
+    private boolean writeToStream(ObjectOutputStream out, Message message, String nodeId) {
         try {
             synchronized (out) {
                 out.writeObject(message);
                 out.flush();
                 out.reset();
             }
+            return true;
         } catch (IOException e) {
             Log.w(TAG, "Write to " + nodeId + " failed: " + e.getMessage());
             notifyNodeDisconnected(nodeId);
+            return false;
         }
+    }
+
+    /**
+     * Queues a message for store-and-forward delivery via Room persistence.
+     * Only queues user chat messages — control frames are not persisted.
+     */
+    private void queueForStoreAndForward(Message message, String nextHopAddress) {
+        if (message.isControlFrame()) return; // don't persist heartbeats/handshakes
+        storeAndForwardManager.enqueue(message, nextHopAddress, message.getRecipientId());
+        Log.d(TAG, "Queued message " + message.getId() + " for SAF to " + nextHopAddress);
+    }
+
+    /**
+     * Delivery callback for StoreAndForwardManager.
+     * Attempts to write a stored message to the peer's output stream.
+     *
+     * @param message The deserialized Message from the Room database
+     * @param address The next-hop address (BT MAC or WiFi Direct IP)
+     * @return true if delivery succeeded
+     */
+    private boolean deliverStoredMessage(Message message, String address) {
+        ObjectOutputStream out = bluetoothOutputStreams.get(address);
+        if (out == null) out = wifiDirectOutputStreams.get(address);
+        if (out == null) return false;
+        return writeToStream(out, message, address);
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -1483,6 +1539,9 @@ public class MeshManager {
         notifyNodeInfoUpdated();
         flushBroadcastQueue();
 
+        // Attempt delivery of any Room-persisted messages for this peer
+        storeAndForwardManager.attemptDelivery(mac);
+
         // Kick off a fresh scan shortly after each new connection so that
         // already-connected nodes quickly discover any additional peers that
         // may have joined the network around the same time.
@@ -1522,6 +1581,10 @@ public class MeshManager {
 
     public void setMessageListener(MessageListener listener) {
         this.messageListener = listener;
+    }
+
+    public StoreAndForwardManager getStoreAndForwardManager() {
+        return storeAndForwardManager;
     }
 
     public int getConnectedNodeCount() { return connectedNodes.size(); }
@@ -1646,6 +1709,11 @@ public class MeshManager {
         // BLE cleanup
         if (bleAdvertiser != null) {
             bleAdvertiser.cleanup();
+        }
+
+        // Store & Forward cleanup
+        if (storeAndForwardManager != null) {
+            storeAndForwardManager.shutdown();
         }
 
         Log.d(TAG, "MeshManager cleaned up.");
