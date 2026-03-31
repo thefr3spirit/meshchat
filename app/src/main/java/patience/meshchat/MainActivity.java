@@ -505,11 +505,13 @@ public class MainActivity extends AppCompatActivity {
             addIfNeeded(needed, Manifest.permission.BLUETOOTH);
             addIfNeeded(needed, Manifest.permission.BLUETOOTH_ADMIN);
         }
-        // Location required for BT scanning
+        // Location required for BT + WiFi Direct discovery
         addIfNeeded(needed, Manifest.permission.ACCESS_FINE_LOCATION);
         addIfNeeded(needed, Manifest.permission.ACCESS_COARSE_LOCATION);
 
+        // WiFi Direct (NEARBY_WIFI_DEVICES required on API 33+)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            addIfNeeded(needed, Manifest.permission.NEARBY_WIFI_DEVICES);
             addIfNeeded(needed, Manifest.permission.POST_NOTIFICATIONS);
         }
 

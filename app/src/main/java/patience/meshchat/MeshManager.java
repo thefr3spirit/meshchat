@@ -11,6 +11,12 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.net.NetworkInfo;
+import android.net.wifi.p2p.WifiP2pConfig;
+import android.net.wifi.p2p.WifiP2pDevice;
+import android.net.wifi.p2p.WifiP2pDeviceList;
+import android.net.wifi.p2p.WifiP2pInfo;
+import android.net.wifi.p2p.WifiP2pManager;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
@@ -21,6 +27,10 @@ import androidx.core.content.ContextCompat;
 import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
@@ -35,16 +45,17 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
 /**
- * MeshManager — Bluetooth-only mesh networking engine.
+ * MeshManager — Bluetooth + WiFi Direct mesh networking engine.
  *
  * Responsibilities:
- *  1. PEER DISCOVERY    — Scans for Bluetooth devices advertising our network name
- *  2. CONNECTIONS       — RFCOMM connections to nearby peers
+ *  1. PEER DISCOVERY    — Scans for Bluetooth devices and WiFi Direct peers
+ *  2. CONNECTIONS       — RFCOMM (Bluetooth) + TCP (WiFi Direct) connections
  *  3. MESSAGE ROUTING   — Broadcast and private (addressed) message routing
  *  4. ENCRYPTION        — AES-256-GCM via CryptoManager
  *  5. OFFLINE QUEUING   — Per-recipient queues, flushed on reconnect
  *  6. IDENTITY          — Handshake protocol to exchange usernames and UUIDs
  *  7. DISTANCE CONTROL  — RSSI threshold determines whether to auto-connect
+ *  8. WIFI DIRECT       — Group Owner discovery and group formation
  *
  * NETWORK NAMING:
  * ──────────────
@@ -66,6 +77,23 @@ import java.util.concurrent.TimeUnit;
  * Devices above the threshold are auto-connected (direct link).
  * Devices below it are tracked but not auto-connected (rely on relay nodes).
  * Users can adjust this threshold in Settings.
+ *
+ * WIFI DIRECT GROUP OWNER (GO) ASYMMETRY:
+ * ────────────────────────────────────────
+ * WiFi Direct uses WifiP2pManager to discover peers and form groups.
+ * One device is elected Group Owner (GO) — it acts as a soft access point.
+ * All other peers connect to the GO via TCP sockets.
+ *
+ * KEY ASYMMETRY: Non-GO peers CANNOT communicate directly with each other.
+ * They must route all messages through the GO. The GO acts as a relay hub:
+ *   - When the GO receives a message from peer A, it forwards to all other
+ *     WiFi Direct peers (B, C, …) and also to any Bluetooth-connected nodes.
+ *   - When peer A wants to reach peer B, the path is: A → GO → B.
+ *
+ * This is handled transparently by sendToAllPeers(), which iterates both
+ * Bluetooth and WiFi Direct output streams. The deduplication layer
+ * (processedMessages) prevents the same message from being processed twice
+ * even if it arrives via both transports.
  */
 public class MeshManager {
 
@@ -126,6 +154,45 @@ public class MeshManager {
 
     private BluetoothAdapter bluetoothAdapter;
     private BluetoothServerThread bluetoothServerThread;
+
+    // ─── WiFi Direct ────────────────────────────────────────────────────
+
+    private WifiP2pManager wifiP2pManager;
+    private WifiP2pManager.Channel wifiP2pChannel;
+
+    /**
+     * Whether this device is the WiFi Direct Group Owner (GO).
+     * The GO acts as a soft AP — all peers connect to it via TCP.
+     * Non-GO peers cannot communicate directly with each other;
+     * they must route through the GO.
+     */
+    private volatile boolean isGroupOwner = false;
+
+    /** IP address of the Group Owner (non-null after group formation) */
+    private volatile InetAddress groupOwnerAddress;
+
+    /** TCP server thread — runs only on the Group Owner */
+    private WifiDirectServerThread wifiDirectServerThread;
+
+    /** Port used for WiFi Direct TCP connections */
+    private static final int WIFI_DIRECT_PORT = 8988;
+
+    /** WiFi Direct enabled flag (updated by P2P state broadcasts) */
+    private volatile boolean wifiP2pEnabled = false;
+
+    /** Output streams for WiFi Direct peers (keyed by IP address string) */
+    private final Map<String, ObjectOutputStream> wifiDirectOutputStreams =
+            new ConcurrentHashMap<>();
+
+    /** Active WiFi Direct TCP sockets (keyed by IP address string) */
+    private final Map<String, Socket> wifiDirectSockets = new ConcurrentHashMap<>();
+
+    /** IP addresses of peers connected via WiFi Direct */
+    private final Set<String> wifiDirectConnectedNodes = ConcurrentHashMap.newKeySet();
+
+    /** Discovered WiFi Direct devices (device address → WifiP2pDevice) */
+    private final Map<String, WifiP2pDevice> discoveredWifiDirectDevices =
+            new ConcurrentHashMap<>();
 
     // ─── Connection tracking ────────────────────────────────────────────
 
@@ -259,6 +326,7 @@ public class MeshManager {
         if (bluetoothAdapter != null) {
             setupBluetooth();
         }
+        initializeWifiDirect();
         registerReceivers();
         startPeriodicDiscovery();
     }
@@ -286,12 +354,47 @@ public class MeshManager {
         return full.length() > BT_NAME_MAX ? full.substring(0, BT_NAME_MAX) : full;
     }
 
+    // ─── WiFi Direct setup ──────────────────────────────────────────────
+
+    /**
+     * Initialises the WiFi Direct (P2P) subsystem.
+     *
+     * WiFi Direct allows devices to connect without a traditional WiFi network.
+     * One device is elected as the Group Owner (GO), which acts as a soft AP.
+     * All other peers connect to the GO via TCP sockets.
+     *
+     * Key APIs used:
+     *   - WifiP2pManager: manages WiFi P2P connections
+     *   - WifiP2pManager.Channel: communication channel with the framework
+     */
+    private void initializeWifiDirect() {
+        wifiP2pManager = (WifiP2pManager)
+                context.getSystemService(Context.WIFI_P2P_SERVICE);
+        if (wifiP2pManager != null) {
+            wifiP2pChannel = wifiP2pManager.initialize(
+                    context, Looper.getMainLooper(), null);
+            Log.d(TAG, "WiFi Direct initialised");
+        } else {
+            Log.w(TAG, "WiFi Direct not supported on this device");
+        }
+    }
+
     // ─── Broadcast receivers ────────────────────────────────────────────
 
     private void registerReceivers() {
         IntentFilter btFilter = new IntentFilter();
         btFilter.addAction(BluetoothDevice.ACTION_FOUND);
         context.registerReceiver(bluetoothReceiver, btFilter);
+
+        // WiFi Direct events
+        if (wifiP2pManager != null) {
+            IntentFilter wdFilter = new IntentFilter();
+            wdFilter.addAction(WifiP2pManager.WIFI_P2P_STATE_CHANGED_ACTION);
+            wdFilter.addAction(WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION);
+            wdFilter.addAction(WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION);
+            wdFilter.addAction(WifiP2pManager.WIFI_P2P_THIS_DEVICE_CHANGED_ACTION);
+            context.registerReceiver(wifiDirectReceiver, wdFilter);
+        }
     }
 
     /**
@@ -348,6 +451,180 @@ public class MeshManager {
         }
     };
 
+    // ─── WiFi Direct receiver ───────────────────────────────────────────
+
+    /**
+     * Handles WiFi Direct system events.
+     *
+     * WIFI_P2P_STATE_CHANGED_ACTION
+     *   → Tells us if WiFi P2P is enabled or disabled on the device.
+     *
+     * WIFI_P2P_PEERS_CHANGED_ACTION
+     *   → Fired after discoverPeers() finds results.
+     *     We call requestPeers() to get the actual WifiP2pDeviceList.
+     *
+     * WIFI_P2P_CONNECTION_CHANGED_ACTION
+     *   → Fired when a WiFi Direct group is formed or torn down.
+     *     We call requestConnectionInfo() to learn if we are the Group Owner
+     *     (GO) or a peer, and get the GO's IP address.
+     *
+     *     GROUP OWNER ASYMMETRY:
+     *       - GO starts a TCP ServerSocket to accept peer connections.
+     *       - Non-GO peers connect a TCP Socket to the GO's IP.
+     *       - Non-GO peers can only reach each other through the GO.
+     *
+     * WIFI_P2P_THIS_DEVICE_CHANGED_ACTION
+     *   → Fired when this device's P2P details change (name, status, etc.).
+     */
+    private final BroadcastReceiver wifiDirectReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context ctx, Intent intent) {
+            String action = intent.getAction();
+            if (action == null) return;
+
+            switch (action) {
+                case WifiP2pManager.WIFI_P2P_STATE_CHANGED_ACTION: {
+                    int state = intent.getIntExtra(
+                            WifiP2pManager.EXTRA_WIFI_STATE, -1);
+                    wifiP2pEnabled =
+                            (state == WifiP2pManager.WIFI_P2P_STATE_ENABLED);
+                    Log.d(TAG, "WiFi P2P enabled: " + wifiP2pEnabled);
+                    break;
+                }
+
+                case WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION: {
+                    // Peer list updated — request the current list
+                    if (wifiP2pManager == null || wifiP2pChannel == null) break;
+                    try {
+                        wifiP2pManager.requestPeers(wifiP2pChannel,
+                                MeshManager.this::onWifiDirectPeersAvailable);
+                    } catch (SecurityException e) {
+                        Log.w(TAG, "requestPeers permission denied: "
+                                + e.getMessage());
+                    }
+                    break;
+                }
+
+                case WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION: {
+                    if (wifiP2pManager == null || wifiP2pChannel == null) break;
+                    NetworkInfo networkInfo = intent.getParcelableExtra(
+                            WifiP2pManager.EXTRA_NETWORK_INFO);
+                    if (networkInfo != null && networkInfo.isConnected()) {
+                        // Group formed — find out if we are the GO or a peer
+                        wifiP2pManager.requestConnectionInfo(wifiP2pChannel,
+                                MeshManager.this::onWifiDirectConnectionInfoAvailable);
+                    } else {
+                        // Group lost — clean up WiFi Direct connections
+                        Log.d(TAG, "WiFi Direct group lost");
+                        handleWifiDirectGroupLost();
+                    }
+                    break;
+                }
+
+                case WifiP2pManager.WIFI_P2P_THIS_DEVICE_CHANGED_ACTION: {
+                    WifiP2pDevice device = intent.getParcelableExtra(
+                            WifiP2pManager.EXTRA_WIFI_P2P_DEVICE);
+                    if (device != null) {
+                        Log.d(TAG, "This device P2P status: "
+                                + deviceStatusToString(device.status));
+                    }
+                    break;
+                }
+            }
+        }
+    };
+
+    /**
+     * Callback for WifiP2pManager.requestPeers().
+     * Populates discoveredWifiDirectDevices with nearby WiFi Direct devices.
+     */
+    private void onWifiDirectPeersAvailable(WifiP2pDeviceList peerList) {
+        discoveredWifiDirectDevices.clear();
+        for (WifiP2pDevice device : peerList.getDeviceList()) {
+            discoveredWifiDirectDevices.put(device.deviceAddress, device);
+            Log.d(TAG, "WiFi Direct peer: " + device.deviceName
+                    + " (" + device.deviceAddress + ") status="
+                    + deviceStatusToString(device.status));
+        }
+        // Notify UI so it can show WiFi Direct peers alongside BT peers
+        notifyNodeInfoUpdated();
+    }
+
+    /**
+     * Callback for WifiP2pManager.requestConnectionInfo().
+     *
+     * Called after a WiFi Direct group is formed. Determines our role:
+     *   - Group Owner (GO): starts a TCP ServerSocket on WIFI_DIRECT_PORT.
+     *     All peers connect to us. We relay messages between them.
+     *   - Peer (non-GO): connects a TCP Socket to the GO's IP address.
+     *     All our WiFi Direct traffic routes through the GO.
+     *
+     * This is the core of the GO/peer asymmetry handling.
+     */
+    private void onWifiDirectConnectionInfoAvailable(WifiP2pInfo info) {
+        if (info == null) return;
+
+        groupOwnerAddress = info.groupOwnerAddress;
+        isGroupOwner = info.isGroupOwner;
+
+        Log.d(TAG, "WiFi Direct connection info: GO=" + isGroupOwner
+                + " GO_addr=" + (groupOwnerAddress != null
+                        ? groupOwnerAddress.getHostAddress() : "null")
+                + " groupFormed=" + info.groupFormed);
+
+        if (!info.groupFormed) return;
+
+        if (isGroupOwner) {
+            // ── WE ARE THE GROUP OWNER ──────────────────────────────────
+            // Start a TCP server. All WiFi Direct peers connect to us.
+            // We act as a relay hub: messages from one peer are forwarded
+            // to all other peers (both WiFi Direct and Bluetooth).
+            if (wifiDirectServerThread == null || !wifiDirectServerThread.isAlive()) {
+                wifiDirectServerThread = new WifiDirectServerThread();
+                wifiDirectServerThread.start();
+                Log.d(TAG, "GO: Started WiFi Direct TCP server on port "
+                        + WIFI_DIRECT_PORT);
+            }
+        } else {
+            // ── WE ARE A PEER (non-GO) ──────────────────────────────────
+            // Connect to the GO's TCP server. All our WiFi Direct messages
+            // go through the GO — we cannot reach other peers directly.
+            if (groupOwnerAddress != null) {
+                String goIp = groupOwnerAddress.getHostAddress();
+                if (!wifiDirectConnectedNodes.contains(goIp)) {
+                    new WifiDirectClientThread(groupOwnerAddress).start();
+                    Log.d(TAG, "Peer: Connecting to GO at " + goIp);
+                }
+            }
+        }
+    }
+
+    /** Cleans up all WiFi Direct connections when the P2P group is lost. */
+    private void handleWifiDirectGroupLost() {
+        isGroupOwner = false;
+        groupOwnerAddress = null;
+        if (wifiDirectServerThread != null) {
+            wifiDirectServerThread.interrupt();
+            wifiDirectServerThread = null;
+        }
+        // Disconnect all WiFi Direct peers
+        for (String addr : new ArrayList<>(wifiDirectConnectedNodes)) {
+            notifyNodeDisconnected(addr);
+        }
+    }
+
+    /** Converts a WifiP2pDevice status int to a readable string. */
+    private static String deviceStatusToString(int status) {
+        switch (status) {
+            case WifiP2pDevice.AVAILABLE:   return "Available";
+            case WifiP2pDevice.INVITED:     return "Invited";
+            case WifiP2pDevice.CONNECTED:   return "Connected";
+            case WifiP2pDevice.FAILED:      return "Failed";
+            case WifiP2pDevice.UNAVAILABLE: return "Unavailable";
+            default: return "Unknown(" + status + ")";
+        }
+    }
+
     // ═══════════════════════════════════════════════════════════════════
     // NETWORK MANAGEMENT
     // ═══════════════════════════════════════════════════════════════════
@@ -386,6 +663,13 @@ public class MeshManager {
         for (String mac : snapshot) {
             notifyNodeDisconnected(mac);
         }
+
+        // Remove WiFi Direct group if we formed one
+        if (wifiP2pManager != null && wifiP2pChannel != null) {
+            wifiP2pManager.removeGroup(wifiP2pChannel, null);
+        }
+        isGroupOwner = false;
+        groupOwnerAddress = null;
 
         // Reset BT name
         try {
@@ -428,16 +712,28 @@ public class MeshManager {
     // DISCOVERY
     // ═══════════════════════════════════════════════════════════════════
 
-    /** Starts a Bluetooth scan. Called by the UI and periodically by the scheduler. */
+    /**
+     * Starts a Bluetooth + WiFi Direct scan.
+     * Called by the UI and periodically by the scheduler.
+     */
     public void startDiscovery() {
         discoveredPeers.clear();
+
+        // ── Bluetooth discovery ─────────────────────────────────────────
         try {
             if (bluetoothAdapter != null && !bluetoothAdapter.isDiscovering()) {
                 bluetoothAdapter.startDiscovery();
             }
         } catch (SecurityException e) {
-            Log.w(TAG, "Discovery permission denied: " + e.getMessage());
+            Log.w(TAG, "BT discovery permission denied: " + e.getMessage());
         }
+
+        // ── WiFi Direct discovery ───────────────────────────────────────
+        // Uses WifiP2pManager.discoverPeers() to find nearby WiFi Direct
+        // devices. Results arrive asynchronously via the
+        // WIFI_P2P_PEERS_CHANGED_ACTION broadcast, which triggers
+        // requestPeers() → onWifiDirectPeersAvailable().
+        startWifiDirectDiscovery();
         // Notify UI of scan completion after ~12s (standard BT discovery duration)
         mainHandler.postDelayed(() -> {
             if (messageListener != null) {
@@ -462,6 +758,95 @@ public class MeshManager {
     }
 
     // ═══════════════════════════════════════════════════════════════════
+    // WIFI DIRECT DISCOVERY & GROUP FORMATION
+    // ═══════════════════════════════════════════════════════════════════
+
+    /**
+     * Starts WiFi Direct peer discovery using WifiP2pManager.discoverPeers().
+     *
+     * This is an asynchronous call. When peers are found, the system fires
+     * WIFI_P2P_PEERS_CHANGED_ACTION, which triggers requestPeers() in our
+     * BroadcastReceiver, which calls onWifiDirectPeersAvailable().
+     */
+    private void startWifiDirectDiscovery() {
+        if (wifiP2pManager == null || wifiP2pChannel == null || !wifiP2pEnabled) return;
+        try {
+            wifiP2pManager.discoverPeers(wifiP2pChannel,
+                    new WifiP2pManager.ActionListener() {
+                        @Override
+                        public void onSuccess() {
+                            Log.d(TAG, "WiFi Direct peer discovery started");
+                        }
+                        @Override
+                        public void onFailure(int reason) {
+                            Log.w(TAG, "WiFi Direct discovery failed: reason=" + reason);
+                        }
+                    });
+        } catch (SecurityException e) {
+            Log.w(TAG, "WiFi Direct discovery permission denied: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Initiates a WiFi Direct connection to a discovered peer device.
+     *
+     * Uses WifiP2pManager.connect() with a WifiP2pConfig targeting the
+     * specified device address. The system negotiates who becomes the
+     * Group Owner (GO):
+     *   - The GO acts as a soft access point (soft AP).
+     *   - All peers connect to the GO.
+     *   - Non-GO peers CANNOT talk directly to each other — they route
+     *     through the GO.
+     *
+     * After the group is formed, WIFI_P2P_CONNECTION_CHANGED_ACTION fires
+     * and onWifiDirectConnectionInfoAvailable() is called to set up the
+     * TCP data channel.
+     *
+     * @param deviceAddress  WiFi Direct MAC address of the target device
+     *                       (from WifiP2pDevice.deviceAddress)
+     */
+    public void connectWifiDirectPeer(String deviceAddress) {
+        if (wifiP2pManager == null || wifiP2pChannel == null) {
+            Log.w(TAG, "WiFi Direct not available");
+            return;
+        }
+
+        WifiP2pConfig config = new WifiP2pConfig();
+        config.deviceAddress = deviceAddress;
+        // groupOwnerIntent: 0 = don't care, 15 = strongly prefer to be GO
+        // We leave it at default (0) and let the system decide.
+
+        try {
+            wifiP2pManager.connect(wifiP2pChannel, config,
+                    new WifiP2pManager.ActionListener() {
+                        @Override
+                        public void onSuccess() {
+                            Log.d(TAG, "WiFi Direct connect initiated to "
+                                    + deviceAddress);
+                        }
+                        @Override
+                        public void onFailure(int reason) {
+                            Log.w(TAG, "WiFi Direct connect failed to "
+                                    + deviceAddress + ": reason=" + reason);
+                        }
+                    });
+        } catch (SecurityException e) {
+            Log.w(TAG, "WiFi Direct connect permission denied: " + e.getMessage());
+        }
+    }
+
+    /** Returns the list of discovered WiFi Direct devices */
+    public List<WifiP2pDevice> getDiscoveredWifiDirectDevices() {
+        return new ArrayList<>(discoveredWifiDirectDevices.values());
+    }
+
+    /** Whether this device is currently the WiFi Direct Group Owner */
+    public boolean isWifiDirectGroupOwner() { return isGroupOwner; }
+
+    /** Whether WiFi P2P is enabled on this device */
+    public boolean isWifiP2pEnabled() { return wifiP2pEnabled; }
+
+    // ═══════════════════════════════════════════════════════════════════
     // MESSAGE SENDING
     // ═══════════════════════════════════════════════════════════════════
 
@@ -481,7 +866,7 @@ public class MeshManager {
         networkCopy.setContent(cryptoManager.encrypt(message.getContent()));
         networkCopy.setEncrypted(true);
 
-        if (bluetoothOutputStreams.isEmpty()) {
+        if (bluetoothOutputStreams.isEmpty() && wifiDirectOutputStreams.isEmpty()) {
             broadcastOfflineQueue.add(networkCopy);
         } else {
             sendToAllPeers(networkCopy, null);
@@ -511,8 +896,9 @@ public class MeshManager {
         if (recipientMac != null && connectedNodes.contains(recipientMac)) {
             // Direct link — send only to the recipient
             sendToNode(recipientMac, networkCopy);
-        } else if (!bluetoothOutputStreams.isEmpty()) {
-            // Relay through mesh
+        } else if (!bluetoothOutputStreams.isEmpty()
+                || !wifiDirectOutputStreams.isEmpty()) {
+            // Relay through mesh (Bluetooth + WiFi Direct)
             sendToAllPeers(networkCopy, null);
         } else {
             // No peers — queue for when they connect
@@ -523,22 +909,36 @@ public class MeshManager {
     }
 
     /**
-     * Sends a message to all connected peers, optionally excluding the source.
+     * Sends a message to all connected peers via BOTH transports, optionally
+     * excluding the source address.
      *
-     * @param excludeAddress BT MAC to skip (the peer we received this message from),
-     *                       or null to send to everyone.
+     * This is how GO/peer asymmetry is handled transparently:
+     *   - The GO has WiFi Direct streams to each peer → message reaches all.
+     *   - A non-GO peer has only one WD stream (to the GO) → GO relays.
+     *   - Bluetooth peers are reached directly regardless of GO status.
+     *
+     * @param excludeAddress address to skip (BT MAC or WiFi Direct IP of the
+     *                       peer we received this message from), or null.
      */
     private void sendToAllPeers(Message message, String excludeAddress) {
+        // Bluetooth transport
         for (Map.Entry<String, ObjectOutputStream> entry : bluetoothOutputStreams.entrySet()) {
             String mac = entry.getKey();
             if (mac.equals(excludeAddress)) continue;
             writeToStream(entry.getValue(), message, mac);
         }
+        // WiFi Direct transport
+        for (Map.Entry<String, ObjectOutputStream> entry : wifiDirectOutputStreams.entrySet()) {
+            String addr = entry.getKey();
+            if (addr.equals(excludeAddress)) continue;
+            writeToStream(entry.getValue(), message, addr);
+        }
     }
 
-    /** Sends a message to a single specific peer by BT MAC address */
+    /** Sends a message to a single specific peer (checks BT, then WiFi Direct) */
     private void sendToNode(String mac, Message message) {
         ObjectOutputStream out = bluetoothOutputStreams.get(mac);
+        if (out == null) out = wifiDirectOutputStreams.get(mac);
         if (out != null) {
             writeToStream(out, message, mac);
         }
@@ -739,11 +1139,20 @@ public class MeshManager {
         connectedNodes.remove(mac);
         connectingNodes.remove(mac); // allow reconnection attempts after a drop
 
+        // Bluetooth cleanup
         ObjectOutputStream out = bluetoothOutputStreams.remove(mac);
         if (out != null) { try { out.close(); } catch (IOException ignored) {} }
 
         BluetoothSocket sock = bluetoothSockets.remove(mac);
         if (sock != null) { try { sock.close(); } catch (IOException ignored) {} }
+
+        // WiFi Direct cleanup (address may be an IP string)
+        ObjectOutputStream wdOut = wifiDirectOutputStreams.remove(mac);
+        if (wdOut != null) { try { wdOut.close(); } catch (IOException ignored) {} }
+
+        Socket wdSock = wifiDirectSockets.remove(mac);
+        if (wdSock != null) { try { wdSock.close(); } catch (IOException ignored) {} }
+        wifiDirectConnectedNodes.remove(mac);
 
         // Clean up identity maps
         String uuid = addressToNodeId.remove(mac);
@@ -853,6 +1262,7 @@ public class MeshManager {
             discoveryScheduler.shutdownNow();
         }
         try { context.unregisterReceiver(bluetoothReceiver); } catch (Exception ignored) {}
+        try { context.unregisterReceiver(wifiDirectReceiver); } catch (Exception ignored) {}
         if (bluetoothServerThread != null) bluetoothServerThread.interrupt();
 
         for (ObjectOutputStream out : bluetoothOutputStreams.values()) {
@@ -861,6 +1271,19 @@ public class MeshManager {
         for (BluetoothSocket s : bluetoothSockets.values()) {
             try { s.close(); } catch (IOException ignored) {}
         }
+
+        // WiFi Direct cleanup
+        if (wifiDirectServerThread != null) wifiDirectServerThread.interrupt();
+        for (ObjectOutputStream out : wifiDirectOutputStreams.values()) {
+            try { out.close(); } catch (IOException ignored) {}
+        }
+        for (Socket s : wifiDirectSockets.values()) {
+            try { s.close(); } catch (IOException ignored) {}
+        }
+        if (wifiP2pManager != null && wifiP2pChannel != null) {
+            wifiP2pManager.removeGroup(wifiP2pChannel, null);
+        }
+
         Log.d(TAG, "MeshManager cleaned up.");
     }
 
@@ -1016,6 +1439,156 @@ public class MeshManager {
                 Log.e(TAG, "Unknown object from: " + mac);
             } finally {
                 if (!mac.isEmpty()) notifyNodeDisconnected(mac);
+            }
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // WIFI DIRECT NETWORKING THREADS
+    // ═══════════════════════════════════════════════════════════════════
+
+    /**
+     * TCP server that runs ONLY on the Group Owner (GO).
+     *
+     * GROUP OWNER ASYMMETRY:
+     * ──────────────────────
+     * The GO acts as a relay hub for all WiFi Direct peers:
+     *   - Each peer connects a TCP socket to the GO on WIFI_DIRECT_PORT.
+     *   - The GO accepts these connections and spawns a
+     *     WifiDirectReceiverThread for each one.
+     *   - When the GO receives a message from peer A, sendToAllPeers()
+     *     forwards it to all other peers (B, C, …) and also to any
+     *     Bluetooth-connected nodes.
+     *   - Non-GO peers CANNOT reach each other directly — all traffic
+     *     between them must pass through the GO.
+     *
+     * This thread blocks on ServerSocket.accept() in a loop, handling
+     * new peer connections as they arrive.
+     */
+    private class WifiDirectServerThread extends Thread {
+
+        WifiDirectServerThread() { setName("WD-Server"); }
+
+        @Override
+        public void run() {
+            try (ServerSocket serverSocket = new ServerSocket(WIFI_DIRECT_PORT)) {
+                serverSocket.setReuseAddress(true);
+                Log.d(TAG, "WiFi Direct TCP server listening on port "
+                        + WIFI_DIRECT_PORT);
+
+                while (!isInterrupted()) {
+                    Socket client = serverSocket.accept();
+                    String peerIp = client.getInetAddress().getHostAddress();
+                    Log.d(TAG, "GO: Accepted WiFi Direct connection from " + peerIp);
+
+                    wifiDirectSockets.put(peerIp, client);
+                    new WifiDirectReceiverThread(client, peerIp).start();
+                }
+            } catch (IOException e) {
+                if (!isInterrupted()) {
+                    Log.e(TAG, "WiFi Direct server error: " + e.getMessage());
+                }
+            }
+        }
+    }
+
+    /**
+     * Connects to the Group Owner's TCP server (runs on non-GO peers).
+     *
+     * NON-GO PEER BEHAVIOUR:
+     * ──────────────────────
+     * A non-GO peer has exactly ONE WiFi Direct connection — to the GO.
+     * All messages sent by this peer go to the GO, which relays them to
+     * the appropriate recipients (other WiFi Direct peers or Bluetooth nodes).
+     *
+     * This asymmetry means:
+     *   - Peer A sends msg → GO receives → GO forwards to Peer B
+     *   - Peer A CANNOT send directly to Peer B
+     *   - The GO is always the intermediary for WiFi Direct traffic
+     */
+    private class WifiDirectClientThread extends Thread {
+        private final InetAddress goAddress;
+
+        WifiDirectClientThread(InetAddress goAddress) {
+            this.goAddress = goAddress;
+            setName("WD-Client-" + goAddress.getHostAddress());
+        }
+
+        @Override
+        public void run() {
+            String goIp = goAddress.getHostAddress();
+            Socket socket = new Socket();
+            try {
+                Log.d(TAG, "Peer: Connecting to GO at " + goIp + ":" + WIFI_DIRECT_PORT);
+                socket.connect(new InetSocketAddress(goAddress, WIFI_DIRECT_PORT), 10_000);
+
+                wifiDirectSockets.put(goIp, socket);
+                new WifiDirectReceiverThread(socket, goIp).start();
+
+            } catch (IOException e) {
+                Log.e(TAG, "WiFi Direct connect to GO failed: " + e.getMessage());
+                try { socket.close(); } catch (IOException ignored) {}
+            }
+        }
+    }
+
+    /**
+     * Manages bidirectional messaging on an established WiFi Direct TCP socket.
+     *
+     * Works identically to the Bluetooth MessageReceiverThread:
+     *   1. Creates ObjectOutputStream (flush header first to avoid deadlock).
+     *   2. Creates ObjectInputStream.
+     *   3. Sends our handshake (username + UUID + FCM token).
+     *   4. Enters a read loop, dispatching incoming messages to
+     *      handleIncomingMessage() with the peer's IP as sourceAddress.
+     *
+     * When the GO's handleIncomingMessage() receives a message from a peer,
+     * it relays the message to ALL other connected nodes (excluding the source)
+     * via sendToAllPeers(). This is how the GO bridges WiFi Direct peers that
+     * cannot talk directly to each other.
+     */
+    private class WifiDirectReceiverThread extends Thread {
+        private final Socket socket;
+        private final String peerAddress;
+
+        WifiDirectReceiverThread(Socket socket, String peerAddress) {
+            this.socket = socket;
+            this.peerAddress = peerAddress;
+            setName("WD-Receiver-" + peerAddress);
+        }
+
+        @Override
+        public void run() {
+            try {
+                // Output stream MUST be created and flushed before input stream
+                // to prevent deadlock (same as Bluetooth — both sides write their
+                // stream header first, then read).
+                ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
+                out.flush();
+                wifiDirectOutputStreams.put(peerAddress, out);
+
+                ObjectInputStream in = new ObjectInputStream(socket.getInputStream());
+
+                // Send handshake immediately
+                sendHandshake(out);
+
+                // Mark this peer as connected
+                wifiDirectConnectedNodes.add(peerAddress);
+                notifyNodeConnected(peerAddress);
+
+                // Read loop — blocks until data or disconnection
+                while (!isInterrupted()) {
+                    Object received = in.readObject();
+                    if (received instanceof Message) {
+                        handleIncomingMessage((Message) received, peerAddress);
+                    }
+                }
+            } catch (IOException e) {
+                Log.d(TAG, "WiFi Direct connection lost: " + peerAddress);
+            } catch (ClassNotFoundException e) {
+                Log.e(TAG, "Unknown object from WiFi Direct peer: " + peerAddress);
+            } finally {
+                notifyNodeDisconnected(peerAddress);
             }
         }
     }
