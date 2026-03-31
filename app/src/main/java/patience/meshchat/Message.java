@@ -37,6 +37,14 @@ public class Message implements Serializable {
      */
     public static final int SUBTYPE_ACK = 2;
 
+    /**
+     * Heartbeat — broadcast periodically to signal liveness.
+     * Content format: "username|nodeUUID"
+     * Used for stale peer detection: peers that stop sending heartbeats
+     * are considered offline and evicted after a timeout.
+     */
+    public static final int SUBTYPE_HEARTBEAT = 3;
+
     // ─── Channel types ──────────────────────────────────────────────────
 
     /** Message is broadcast to everyone in the network */
@@ -162,6 +170,23 @@ public class Message implements Serializable {
     }
 
     /**
+     * Creates a heartbeat message to broadcast liveness.
+     * Content: "username|nodeUUID"
+     */
+    public static Message createHeartbeat(String username, String nodeId) {
+        Message m = new Message("", TYPE_SENT);
+        m.id = UUID.randomUUID().toString();
+        m.subType = SUBTYPE_HEARTBEAT;
+        m.content = username + "|" + nodeId;
+        m.senderId = nodeId;
+        m.senderName = username;
+        m.channelType = CHANNEL_BROADCAST;
+        m.encrypted = false;
+        m.ttlMs = m.timestamp + (5L * 60 * 1000); // 5 min TTL (short-lived)
+        return m;
+    }
+
+    /**
      * Creates an ACK message confirming delivery of a private message.
      *
      * @param originalMsgId  The ID of the message being acknowledged
@@ -217,9 +242,10 @@ public class Message implements Serializable {
     public boolean canForward() { return hopCount < MAX_HOPS; }
     public boolean isExpired() { return System.currentTimeMillis() > ttlMs; }
 
-    /** Whether this is a control frame (handshake or ACK) rather than user content */
+    /** Whether this is a control frame (handshake, ACK, or heartbeat) rather than user content */
     public boolean isControlFrame() {
-        return subType == SUBTYPE_HANDSHAKE || subType == SUBTYPE_ACK;
+        return subType == SUBTYPE_HANDSHAKE || subType == SUBTYPE_ACK
+                || subType == SUBTYPE_HEARTBEAT;
     }
 
     public String getFormattedTime() {
