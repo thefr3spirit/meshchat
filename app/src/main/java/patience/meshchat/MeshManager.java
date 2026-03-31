@@ -26,6 +26,9 @@ import android.util.Log;
 
 import androidx.core.content.ContextCompat;
 
+import patience.meshchat.transport.CompositeTransport;
+import patience.meshchat.transport.MeshTransport;
+
 import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
@@ -188,6 +191,19 @@ public class MeshManager {
 
     /** BLE advertiser/scanner for dead-zone peer discovery */
     private BleAdvertiser bleAdvertiser;
+
+    // ─── Transport abstraction layer ────────────────────────────────
+
+    /**
+     * The unified transport provided by Hilt DI.
+     * CompositeTransport wraps WiFi Direct, BLE, and NFC transports
+     * behind a single MeshTransport interface so that the routing logic
+     * (broadcastMessage, sendPrivateMessage, etc.) never needs to know
+     * which physical transport is in use.
+     *
+     * Set via setCompositeTransport() from the @AndroidEntryPoint Service.
+     */
+    private CompositeTransport compositeTransport;
 
     // ─── Store & Forward (Room-persisted queue) ─────────────────────
 
@@ -398,7 +414,95 @@ public class MeshManager {
         registerReceivers();
         startPeriodicDiscovery();
         startHeartbeatScheduler();
+
+        // Start the transport abstraction layer (if injected)
+        if (compositeTransport != null) {
+            compositeTransport.listen(transportCallback);
+            compositeTransport.discover(discoveryTransportCallback);
+        }
     }
+
+    /**
+     * Injects the Hilt-provided CompositeTransport.
+     * Called from MeshService after dependency injection.
+     */
+    public void setCompositeTransport(CompositeTransport transport) {
+        this.compositeTransport = transport;
+        // If already initialized, start listening/discovering immediately
+        compositeTransport.listen(transportCallback);
+        compositeTransport.discover(discoveryTransportCallback);
+    }
+
+    /** Returns the CompositeTransport for diagnostics or direct use */
+    public CompositeTransport getCompositeTransport() {
+        return compositeTransport;
+    }
+
+    /**
+     * Transport callback: receives data and connection events from ALL
+     * transports (WiFi Direct, BLE, NFC) via the CompositeTransport.
+     * Routes incoming data to handleIncomingMessage() just like the
+     * legacy thread-based receivers.
+     */
+    private final MeshTransport.TransportCallback transportCallback =
+            new MeshTransport.TransportCallback() {
+                @Override
+                public void onDataReceived(String peerId, byte[] data,
+                                           String transportName) {
+                    Log.d(TAG, "Transport data from " + peerId
+                            + " via " + transportName
+                            + " (" + data.length + " bytes)");
+                    // Deserialise and route through existing message pipeline
+                    try {
+                        java.io.ObjectInputStream ois =
+                                new java.io.ObjectInputStream(
+                                        new java.io.ByteArrayInputStream(data));
+                        Object obj = ois.readObject();
+                        if (obj instanceof Message) {
+                            handleIncomingMessage((Message) obj, peerId);
+                        }
+                    } catch (Exception e) {
+                        Log.w(TAG, "Transport deser failed: " + e.getMessage());
+                    }
+                }
+
+                @Override
+                public void onPeerConnected(String peerId, String transportName) {
+                    Log.d(TAG, "Transport peer connected: " + peerId
+                            + " via " + transportName);
+                    lastSeenTimestamps.put(peerId, System.currentTimeMillis());
+                }
+
+                @Override
+                public void onPeerDisconnected(String peerId, String transportName) {
+                    Log.d(TAG, "Transport peer disconnected: " + peerId
+                            + " via " + transportName);
+                    lastSeenTimestamps.remove(peerId);
+                }
+            };
+
+    /**
+     * Discovery callback: receives peer-found/lost events from ALL
+     * transports via the CompositeTransport.
+     */
+    private final MeshTransport.DiscoveryCallback discoveryTransportCallback =
+            new MeshTransport.DiscoveryCallback() {
+                @Override
+                public void onPeerDiscovered(String peerId, String displayName,
+                                             int rssi, String transportName) {
+                    Log.d(TAG, "Transport discovered: " + peerId
+                            + " (" + displayName + ") via " + transportName);
+                    if (rssi != 0) {
+                        rssiValues.put(peerId, rssi);
+                    }
+                }
+
+                @Override
+                public void onPeerLost(String peerId, String transportName) {
+                    Log.d(TAG, "Transport peer lost: " + peerId
+                            + " via " + transportName);
+                }
+            };
 
     // ─── Bluetooth setup ────────────────────────────────────────────────
 
@@ -1840,6 +1944,11 @@ public class MeshManager {
         dutyCycleHandler.removeCallbacksAndMessages(null);
         if (bleAdvertiser != null) {
             bleAdvertiser.cleanup();
+        }
+
+        // Transport abstraction layer cleanup
+        if (compositeTransport != null) {
+            compositeTransport.cleanup();
         }
 
         // Store & Forward cleanup

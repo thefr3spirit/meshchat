@@ -17,6 +17,11 @@ import androidx.work.ExistingPeriodicWorkPolicy;
 import androidx.work.PeriodicWorkRequest;
 import androidx.work.WorkManager;
 
+import javax.inject.Inject;
+
+import dagger.hilt.android.AndroidEntryPoint;
+import patience.meshchat.transport.CompositeTransport;
+
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -49,7 +54,8 @@ import java.util.concurrent.TimeUnit;
  *
  * ============================================================================
  */
-public class MeshService extends Service {
+@AndroidEntryPoint(Service.class)
+public class MeshService extends Hilt_MeshService {
     /** Notification channel ID (required for Android 8.0+) */
     private static final String CHANNEL_ID = "MeshChatServiceChannel";
 
@@ -58,6 +64,10 @@ public class MeshService extends Service {
 
     /** The core mesh networking manager */
     private MeshManager meshManager;
+
+    /** Hilt-injected composite transport (WiFi Direct + BLE + NFC) */
+    @Inject
+    CompositeTransport compositeTransport;
 
     /**
      * Binder class that allows MainActivity to get a reference to this Service.
@@ -84,6 +94,8 @@ public class MeshService extends Service {
         createNotificationChannel();
         // Create the mesh networking manager — this starts BT/WiFi servers
         meshManager = new MeshManager(this);
+        // Wire in the Hilt-provided CompositeTransport
+        meshManager.setCompositeTransport(compositeTransport);
     }
 
     /**

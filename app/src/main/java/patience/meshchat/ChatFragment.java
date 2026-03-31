@@ -23,7 +23,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 import patience.meshchat.ui.ChatViewModel;
-import patience.meshchat.ui.MessageListScreenKt;
+import patience.meshchat.ui.ComposeMessageListHelper;
 
 /**
  * ChatFragment — the actual messaging screen for a single conversation.
@@ -118,13 +118,11 @@ public class ChatFragment extends Fragment {
         // Initialize ChatViewModel and wire up the Compose message list
         chatViewModel = new ViewModelProvider(this).get(ChatViewModel.class);
 
-        composeMessageList.setContent(() -> {
-            MessageListScreenKt.MessageListScreen(
-                    chatViewModel.observeMessages(conversationId),
-                    androidx.compose.ui.Modifier.INSTANCE
-            );
-            return kotlin.Unit.INSTANCE;
-        });
+        // Wire up the Compose message list via Kotlin bridge
+        ComposeMessageListHelper.bind(
+                composeMessageList,
+                chatViewModel.observeMessages(conversationId)
+        );
 
         sendButton.setOnClickListener(v -> sendMessage());
         if (backButton != null) {
