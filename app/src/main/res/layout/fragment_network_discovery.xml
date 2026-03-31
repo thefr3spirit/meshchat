@@ -16,8 +16,8 @@
         android:elevation="4dp"
         android:paddingStart="20dp"
         android:paddingEnd="20dp"
-        android:paddingTop="24dp"
-        android:paddingBottom="20dp"
+        android:paddingTop="30dp"
+        android:paddingBottom="24dp"
         app:layout_constraintTop_toTopOf="parent"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent">
@@ -26,10 +26,10 @@
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:text="@string/app_name"
-            android:textSize="13sp"
-            android:textColor="#B2DFDB"
+            android:textSize="11sp"
+            android:textColor="#80FFFFFF"
             android:textAllCaps="true"
-            android:letterSpacing="0.1" />
+            android:letterSpacing="0.15" />
 
         <TextView
             android:layout_width="wrap_content"
@@ -38,24 +38,26 @@
             android:textSize="24sp"
             android:textStyle="bold"
             android:textColor="@android:color/white"
+            android:letterSpacing="-0.01"
             android:layout_marginTop="4dp" />
 
+        <!-- Scanning status row -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:orientation="horizontal"
             android:gravity="center_vertical"
-            android:layout_marginTop="12dp">
+            android:layout_marginTop="18dp">
 
             <ProgressBar
                 android:id="@+id/scanProgress"
                 style="?android:attr/progressBarStyleHorizontal"
                 android:layout_width="0dp"
-                android:layout_height="4dp"
+                android:layout_height="3dp"
                 android:layout_weight="1"
                 android:indeterminate="true"
-                android:progressTint="@android:color/white"
-                android:indeterminateTint="@android:color/white"
+                android:progressTint="#80FFFFFF"
+                android:indeterminateTint="#80FFFFFF"
                 android:layout_marginEnd="12dp" />
 
             <TextView
@@ -63,19 +65,104 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:text="@string/scanning_for_networks"
-                android:textColor="#B2DFDB"
+                android:textColor="@color/textOnPrimaryMuted"
                 android:textSize="12sp" />
         </LinearLayout>
     </LinearLayout>
+
+    <!-- ═══ Location Map Card ═══ -->
+    <com.google.android.material.card.MaterialCardView
+        android:id="@+id/mapCard"
+        android:layout_width="0dp"
+        android:layout_height="210dp"
+        android:layout_marginStart="12dp"
+        android:layout_marginEnd="12dp"
+        android:layout_marginTop="12dp"
+        app:cardCornerRadius="14dp"
+        app:cardElevation="2dp"
+        app:layout_constraintTop_toBottomOf="@id/discoveryHeader"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent">
+
+        <FrameLayout
+            android:layout_width="match_parent"
+            android:layout_height="match_parent">
+
+            <!-- OSMDroid MapView -->
+            <org.osmdroid.views.MapView
+                android:id="@+id/mapView"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent" />
+
+            <!-- Overlay shown while locating or when GPS is unavailable -->
+            <LinearLayout
+                android:id="@+id/gpsUnavailableView"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:orientation="vertical"
+                android:gravity="center"
+                android:background="@color/surfaceBackground"
+                android:visibility="visible">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="&#128205;"
+                    android:textSize="36sp" />
+
+                <TextView
+                    android:id="@+id/gpsStatusText"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Locating you\u2026"
+                    android:textSize="14sp"
+                    android:textColor="@color/textSecondary"
+                    android:gravity="center"
+                    android:layout_marginTop="8dp" />
+            </LinearLayout>
+
+            <!-- Accuracy chip pinned to bottom-left corner of the map -->
+            <TextView
+                android:id="@+id/locationAccuracyLabel"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="bottom|start"
+                android:layout_margin="8dp"
+                android:background="#AA000000"
+                android:paddingStart="8dp"
+                android:paddingEnd="8dp"
+                android:paddingTop="3dp"
+                android:paddingBottom="3dp"
+                android:text="Locating..."
+                android:textColor="#FFFFFF"
+                android:textSize="11sp"
+                android:visibility="gone" />
+
+        </FrameLayout>
+    </com.google.android.material.card.MaterialCardView>
+
+    <!-- ═══ Nearby Networks section label ═══ -->
+    <TextView
+        android:id="@+id/networksLabel"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="16dp"
+        android:layout_marginEnd="16dp"
+        android:layout_marginTop="16dp"
+        android:text="NEARBY NETWORKS"
+        style="@style/SectionLabel"
+        app:layout_constraintTop_toBottomOf="@id/mapCard"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent" />
 
     <!-- ═══ Network List ═══ -->
     <androidx.recyclerview.widget.RecyclerView
         android:id="@+id/recyclerNetworks"
         android:layout_width="0dp"
         android:layout_height="0dp"
-        android:padding="16dp"
+        android:padding="12dp"
         android:clipToPadding="false"
-        app:layout_constraintTop_toBottomOf="@id/discoveryHeader"
+        app:layout_constraintTop_toBottomOf="@id/networksLabel"
         app:layout_constraintBottom_toBottomOf="parent"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent" />
@@ -90,7 +177,8 @@
         app:icon="@android:drawable/ic_input_add"
         app:iconTint="@android:color/white"
         app:backgroundTint="@color/colorAccent"
-        android:layout_margin="16dp"
+        android:layout_margin="20dp"
+        android:elevation="8dp"
         app:layout_constraintBottom_toBottomOf="parent"
         app:layout_constraintEnd_toEndOf="parent" />
 

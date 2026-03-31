@@ -2,49 +2,81 @@
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
-    android:orientation="vertical"
+    android:orientation="horizontal"
     android:paddingStart="8dp"
-    android:paddingEnd="64dp"
-    android:paddingTop="2dp"
-    android:paddingBottom="2dp">
+    android:paddingEnd="80dp"
+    android:paddingTop="3dp"
+    android:paddingBottom="3dp"
+    android:gravity="top">
 
-    <TextView
-        android:id="@+id/senderInfo"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:textSize="12sp"
-        android:textColor="@color/colorPrimary"
-        android:textStyle="bold"
-        android:layout_marginStart="14dp"
-        android:layout_marginBottom="2dp" />
+    <!-- Sender avatar (decorative placeholder circle) -->
+    <FrameLayout
+        android:layout_width="34dp"
+        android:layout_height="34dp"
+        android:layout_marginEnd="8dp"
+        android:layout_marginTop="18dp">
 
+        <View
+            android:layout_width="34dp"
+            android:layout_height="34dp"
+            android:background="@drawable/avatar_circle"
+            android:backgroundTint="@color/colorPrimaryLight" />
+
+        <TextView
+            android:id="@+id/receivedAvatar"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:gravity="center"
+            android:textSize="13sp"
+            android:textStyle="bold"
+            android:textColor="@android:color/white" />
+    </FrameLayout>
+
+    <!-- Sender name + bubble -->
     <LinearLayout
-        android:layout_width="wrap_content"
+        android:layout_width="0dp"
         android:layout_height="wrap_content"
-        android:orientation="vertical"
-        android:layout_gravity="start"
-        android:background="@drawable/message_bubble_received"
-        android:paddingStart="14dp"
-        android:paddingEnd="14dp"
-        android:paddingTop="8dp"
-        android:paddingBottom="8dp">
+        android:layout_weight="1"
+        android:orientation="vertical">
 
         <TextView
-            android:id="@+id/messageText"
+            android:id="@+id/senderInfo"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:textColor="@color/bubbleReceivedText"
-            android:textSize="15sp" />
+            android:textSize="12sp"
+            android:textColor="@color/colorPrimary"
+            android:textStyle="bold"
+            android:layout_marginStart="2dp"
+            android:layout_marginBottom="3dp" />
 
-        <TextView
-            android:id="@+id/timeText"
+        <LinearLayout
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:textColor="#757575"
-            android:textSize="11sp"
-            android:layout_marginTop="4dp"
-            android:layout_gravity="end" />
+            android:orientation="vertical"
+            android:layout_gravity="start"
+            android:background="@drawable/message_bubble_received"
+            android:paddingStart="14dp"
+            android:paddingEnd="14dp"
+            android:paddingTop="10dp"
+            android:paddingBottom="8dp">
 
+            <TextView
+                android:id="@+id/messageText"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:textColor="@color/bubbleReceivedText"
+                android:textSize="15sp"
+                android:lineSpacingExtra="2dp" />
+
+            <TextView
+                android:id="@+id/timeText"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:textColor="@color/textHint"
+                android:textSize="11sp"
+                android:layout_marginTop="5dp"
+                android:layout_gravity="end" />
+        </LinearLayout>
     </LinearLayout>
 
 </LinearLayout>

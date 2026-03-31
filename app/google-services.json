@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "925918213595",
+    "project_id": "meshchat-56aaf",
+    "storage_bucket": "meshchat-56aaf.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:925918213595:android:07e5f707d1f6aa83ae63fe",
+        "android_client_info": {
+          "package_name": "patience.meshchat"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyD6gfBiZjYNc0I7y1e1PODLlfhMZLMqzpk"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

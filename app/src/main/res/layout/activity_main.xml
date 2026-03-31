@@ -5,13 +5,29 @@
     android:id="@+id/main"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:orientation="vertical">
+    android:orientation="vertical"
+    android:background="@color/headerBackground"
+    android:animateLayoutChanges="true">
+
+    <!-- Connectivity banner — slides in/out via animateLayoutChanges -->
+    <TextView
+        android:id="@+id/connectivityBanner"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:paddingTop="9dp"
+        android:paddingBottom="9dp"
+        android:paddingStart="16dp"
+        android:paddingEnd="16dp"
+        android:gravity="center"
+        android:textColor="#FFFFFF"
+        android:textSize="13sp"
+        android:textStyle="bold"
+        android:visibility="gone" />
 
     <!--
         Fragment container — fills all remaining space.
-        When BottomNavigationView is GONE (discovery screen / chat screen),
-        this LinearLayout child with weight=1 automatically expands to fill
-        the entire height.
+        When BottomNavigationView is GONE (discovery / chat screen),
+        this child with weight=1 automatically expands to fill full height.
     -->
     <FrameLayout
         android:id="@+id/fragmentContainer"
@@ -19,13 +35,19 @@
         android:layout_height="0dp"
         android:layout_weight="1" />
 
-    <!-- Bottom Navigation Bar — hidden during network discovery and private chats -->
+    <!-- Hairline divider above navigation bar -->
+    <View
+        android:layout_width="match_parent"
+        android:layout_height="1dp"
+        android:background="@color/dividerColor" />
+
+    <!-- Bottom Navigation Bar -->
     <com.google.android.material.bottomnavigation.BottomNavigationView
         android:id="@+id/bottomNav"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:background="@android:color/white"
-        android:elevation="8dp"
+        android:background="@color/cardBackground"
+        android:elevation="12dp"
         app:menu="@menu/bottom_nav_menu"
         app:labelVisibilityMode="labeled"
         app:itemIconTint="@color/colorPrimary"

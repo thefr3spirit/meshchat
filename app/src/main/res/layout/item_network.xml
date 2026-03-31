@@ -4,7 +4,7 @@
     xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
-    app:cardCornerRadius="16dp"
+    app:cardCornerRadius="14dp"
     app:cardElevation="2dp"
     android:layout_marginBottom="10dp">
 
@@ -15,13 +15,25 @@
         android:gravity="center_vertical"
         android:padding="16dp">
 
-        <!-- Mesh icon placeholder -->
-        <View
-            android:layout_width="48dp"
-            android:layout_height="48dp"
-            android:background="@drawable/avatar_circle"
-            android:backgroundTint="@color/colorPrimaryLight"
-            android:layout_marginEnd="14dp" />
+        <!-- Network icon: tinted circle with mesh emoji -->
+        <FrameLayout
+            android:layout_width="52dp"
+            android:layout_height="52dp"
+            android:layout_marginEnd="14dp">
+
+            <View
+                android:layout_width="52dp"
+                android:layout_height="52dp"
+                android:background="@drawable/avatar_circle"
+                android:backgroundTint="@color/colorPrimaryContainer" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:gravity="center"
+                android:text="\uD83D\uDD17"
+                android:textSize="22sp" />
+        </FrameLayout>
 
         <!-- Name and node count -->
         <LinearLayout
@@ -34,29 +46,31 @@
                 android:id="@+id/networkName"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:textSize="17sp"
+                android:textSize="16sp"
                 android:textStyle="bold"
-                android:textColor="#212121" />
+                android:textColor="@color/textPrimary" />
 
             <TextView
                 android:id="@+id/networkNodeCount"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:textSize="13sp"
-                android:textColor="#757575"
-                android:layout_marginTop="2dp" />
+                android:textColor="@color/textSecondary"
+                android:layout_marginTop="3dp" />
         </LinearLayout>
 
         <!-- Join button -->
         <com.google.android.material.button.MaterialButton
             android:id="@+id/joinButton"
             android:layout_width="wrap_content"
-            android:layout_height="36dp"
+            android:layout_height="38dp"
             android:text="@string/join"
             android:textSize="13sp"
             android:textColor="@android:color/white"
+            android:paddingStart="18dp"
+            android:paddingEnd="18dp"
             app:backgroundTint="@color/colorPrimary"
-            app:cornerRadius="18dp" />
+            app:cornerRadius="20dp" />
     </LinearLayout>
 
 </com.google.android.material.card.MaterialCardView>

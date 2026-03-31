@@ -4,10 +4,11 @@
     xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
-    app:cardCornerRadius="16dp"
+    app:cardCornerRadius="14dp"
     app:cardElevation="2dp"
-    android:layout_marginStart="8dp"
-    android:layout_marginEnd="8dp"
+    android:layout_marginStart="12dp"
+    android:layout_marginEnd="12dp"
+    android:layout_marginTop="4dp"
     android:layout_marginBottom="8dp">
 
     <LinearLayout
@@ -15,17 +16,17 @@
         android:layout_height="wrap_content"
         android:orientation="horizontal"
         android:gravity="center_vertical"
-        android:padding="14dp">
+        android:padding="16dp">
 
-        <!-- Avatar circle -->
+        <!-- Avatar with online status dot -->
         <FrameLayout
-            android:layout_width="48dp"
-            android:layout_height="48dp"
+            android:layout_width="52dp"
+            android:layout_height="52dp"
             android:layout_marginEnd="14dp">
 
             <View
-                android:layout_width="48dp"
-                android:layout_height="48dp"
+                android:layout_width="52dp"
+                android:layout_height="52dp"
                 android:background="@drawable/avatar_circle"
                 android:backgroundTint="@color/colorPrimary" />
 
@@ -34,12 +35,21 @@
                 android:layout_width="match_parent"
                 android:layout_height="match_parent"
                 android:gravity="center"
-                android:textSize="18sp"
+                android:textSize="20sp"
                 android:textStyle="bold"
                 android:textColor="@android:color/white" />
+
+            <!-- Online indicator dot in bottom-right corner -->
+            <View
+                android:layout_width="13dp"
+                android:layout_height="13dp"
+                android:background="@drawable/status_dot"
+                android:backgroundTint="@color/statusOnline"
+                android:layout_gravity="bottom|end"
+                android:layout_margin="1dp" />
         </FrameLayout>
 
-        <!-- Name and signal -->
+        <!-- Name and signal strength -->
         <LinearLayout
             android:layout_width="0dp"
             android:layout_height="wrap_content"
@@ -50,19 +60,19 @@
                 android:id="@+id/nodeUsername"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:textSize="15sp"
+                android:textSize="16sp"
                 android:textStyle="bold"
-                android:textColor="#212121" />
+                android:textColor="@color/textPrimary" />
 
-            <!-- Signal row: bars + label -->
+            <!-- Signal bars + label row -->
             <LinearLayout
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:orientation="horizontal"
                 android:gravity="center_vertical"
-                android:layout_marginTop="4dp">
+                android:layout_marginTop="5dp">
 
-                <!-- Signal bars (varying heights, gravity bottom) -->
+                <!-- Signal bars (gravity=bottom so bars grow upward) -->
                 <LinearLayout
                     android:layout_width="wrap_content"
                     android:layout_height="18dp"
@@ -99,7 +109,7 @@
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:textSize="12sp"
-                    android:textColor="#757575" />
+                    android:textColor="@color/textSecondary" />
             </LinearLayout>
         </LinearLayout>
 
@@ -107,12 +117,14 @@
         <com.google.android.material.button.MaterialButton
             android:id="@+id/messageButton"
             android:layout_width="wrap_content"
-            android:layout_height="36dp"
+            android:layout_height="38dp"
             android:text="@string/message"
-            android:textSize="12sp"
+            android:textSize="13sp"
             android:textColor="@android:color/white"
+            android:paddingStart="16dp"
+            android:paddingEnd="16dp"
             app:backgroundTint="@color/colorPrimary"
-            app:cornerRadius="18dp" />
+            app:cornerRadius="20dp" />
     </LinearLayout>
 
 </com.google.android.material.card.MaterialCardView>

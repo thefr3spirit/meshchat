@@ -132,6 +132,13 @@ public class MeshManager {
     /** BT MAC addresses of currently connected peers */
     private final Set<String> connectedNodes = ConcurrentHashMap.newKeySet();
 
+    /**
+     * BT MAC addresses for which a BluetoothClientThread is currently in progress.
+     * Guards against launching duplicate outbound connections to the same device
+     * during overlapping scan cycles or before the handshake has completed.
+     */
+    private final Set<String> connectingNodes = ConcurrentHashMap.newKeySet();
+
     /** Output streams keyed by peer's BT MAC address */
     private final Map<String, ObjectOutputStream> bluetoothOutputStreams =
             new ConcurrentHashMap<>();
@@ -325,10 +332,13 @@ public class MeshManager {
                 discoveredPeers.put(address, new PeerAdapter.PeerInfo(
                         name, address, alreadyConnected, "bluetooth", rssi));
 
-                // Auto-connect if we're in the same network and signal is strong enough
+                // Auto-connect if we're in the same network, signal is strong enough,
+                // and we're not already connected or in the middle of connecting.
+                boolean alreadyConnecting = connectingNodes.contains(address);
                 if (currentNetworkName != null
                         && networkName.equals(currentNetworkName)
                         && !alreadyConnected
+                        && !alreadyConnecting
                         && rssi >= rssiThreshold) {
                     new BluetoothClientThread(device).start();
                 }
@@ -625,7 +635,8 @@ public class MeshManager {
      * Must be called immediately after the ObjectOutputStream is ready.
      */
     private void sendHandshake(ObjectOutputStream out) {
-        Message handshake = Message.createHandshake(username, myNodeId);
+        String fcmToken = FcmTokenManager.getOwnToken(context);
+        Message handshake = Message.createHandshake(username, myNodeId, fcmToken);
         try {
             synchronized (out) {
                 out.writeObject(handshake);
@@ -640,19 +651,29 @@ public class MeshManager {
     /** Processes an incoming handshake, mapping the peer's UUID to their BT MAC */
     private void handleHandshake(Message message, String sourceMac) {
         String content = message.getContent();
-        String[] parts = content.split("\\|", 2);
+        // Format: "username|nodeUUID" (legacy) or "username|nodeUUID|fcmToken"
+        String[] parts = content.split("\\|", 3);
         if (parts.length < 2) return;
 
         String peerUsername = parts[0];
-        String peerNodeId = parts[1];
+        String peerNodeId   = parts[1];
+        String peerFcmToken = (parts.length >= 3 && !parts[2].isEmpty()) ? parts[2] : null;
 
         // Store bidirectional UUID ↔ MAC mapping
         nodeIdToAddress.put(peerNodeId, sourceMac);
         addressToNodeId.put(sourceMac, peerNodeId);
         nodeNames.put(peerNodeId, peerUsername);
 
+        // Persist FCM token for this peer so we can notify them later
+        if (peerFcmToken != null) {
+            FcmTokenManager.savePeerToken(context, peerNodeId, peerFcmToken);
+        }
+
         Log.d(TAG, "Handshake from " + peerUsername + " (" + peerNodeId + ") @ " + sourceMac);
         notifyNodeInfoUpdated();
+
+        // Notify all OTHER connected peers that a new node joined
+        new FcmNotificationSender(context).notifyPeersOfNewNode(peerUsername, peerNodeId);
 
         // Flush any queued private messages for this peer
         flushPerRecipientQueue(peerNodeId, sourceMac);
@@ -707,10 +728,16 @@ public class MeshManager {
         connectedNodes.add(mac);
         notifyNodeInfoUpdated();
         flushBroadcastQueue();
+
+        // Kick off a fresh scan shortly after each new connection so that
+        // already-connected nodes quickly discover any additional peers that
+        // may have joined the network around the same time.
+        mainHandler.postDelayed(this::startDiscovery, 2_000);
     }
 
     private void notifyNodeDisconnected(String mac) {
         connectedNodes.remove(mac);
+        connectingNodes.remove(mac); // allow reconnection attempts after a drop
 
         ObjectOutputStream out = bluetoothOutputStreams.remove(mac);
         if (out != null) { try { out.close(); } catch (IOException ignored) {} }
@@ -858,6 +885,15 @@ public class MeshManager {
                 while (!isInterrupted()) {
                     BluetoothSocket socket = serverSocket.accept();
                     String mac = socket.getRemoteDevice().getAddress();
+
+                    // Cross-connect guard: if our BluetoothClientThread already
+                    // established a connection to this MAC, close the duplicate.
+                    if (connectedNodes.contains(mac) || connectingNodes.contains(mac)) {
+                        Log.d(TAG, "Duplicate incoming connection from " + mac + ", closing.");
+                        try { socket.close(); } catch (IOException ignored) {}
+                        continue;
+                    }
+
                     bluetoothSockets.put(mac, socket);
                     new MessageReceiverThread(socket).start();
                 }
@@ -871,6 +907,10 @@ public class MeshManager {
 
     /**
      * Initiates an outgoing Bluetooth connection to a discovered peer.
+     *
+     * IMPORTANT: Bluetooth discovery MUST be cancelled before calling
+     * socket.connect() — keeping discovery running causes connect() to
+     * time out on most Android devices.
      */
     private class BluetoothClientThread extends Thread {
         private final BluetoothDevice device;
@@ -882,17 +922,49 @@ public class MeshManager {
 
         @Override
         public void run() {
+            String address = device.getAddress();
+
+            // Claim the slot; bail if another thread is already connecting to this MAC.
+            if (!connectingNodes.add(address)) {
+                Log.d(TAG, "Already connecting to " + address + ", skipping.");
+                return;
+            }
+
+            BluetoothSocket socket = null;
             try {
-                BluetoothSocket socket =
-                        device.createRfcommSocketToServiceRecord(MY_UUID);
-                Log.d(TAG, "Connecting to: " + device.getAddress());
+                // ── Step 1: stop discovery ─────────────────────────────────
+                // Android requires this before socket.connect(); skipping it
+                // causes connect() to time out on nearly every device.
+                try {
+                    if (bluetoothAdapter != null && bluetoothAdapter.isDiscovering()) {
+                        bluetoothAdapter.cancelDiscovery();
+                    }
+                } catch (SecurityException ignored) {}
+
+                // ── Step 2: connect ────────────────────────────────────────
+                socket = device.createRfcommSocketToServiceRecord(MY_UUID);
+                Log.d(TAG, "Connecting to: " + address);
                 socket.connect();
-                bluetoothSockets.put(device.getAddress(), socket);
+
+                // ── Step 3: cross-connect guard ────────────────────────────
+                // The remote device may have simultaneously connected to us as
+                // a server. Accept whichever socket arrived first; close this one.
+                if (connectedNodes.contains(address)) {
+                    Log.d(TAG, "Cross-connect detected for " + address + ", closing client socket.");
+                    socket.close();
+                    return;
+                }
+
+                bluetoothSockets.put(address, socket);
                 new MessageReceiverThread(socket).start();
+
             } catch (IOException e) {
-                Log.e(TAG, "BT connect failed: " + e.getMessage());
+                Log.e(TAG, "BT connect failed to " + address + ": " + e.getMessage());
+                if (socket != null) { try { socket.close(); } catch (IOException ignored) {} }
             } catch (SecurityException e) {
                 Log.e(TAG, "BT connect permission denied: " + e.getMessage());
+            } finally {
+                connectingNodes.remove(address);
             }
         }
     }

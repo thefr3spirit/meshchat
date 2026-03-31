@@ -9,7 +9,11 @@ import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
+import android.view.View;
+import android.widget.TextView;
 
 import androidx.activity.EdgeToEdge;
 import androidx.annotation.NonNull;
@@ -23,6 +27,7 @@ import androidx.fragment.app.Fragment;
 import androidx.fragment.app.FragmentTransaction;
 
 import com.google.android.material.bottomnavigation.BottomNavigationView;
+import com.google.firebase.messaging.FirebaseMessaging;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -49,6 +54,13 @@ public class MainActivity extends AppCompatActivity {
     // ─── Service ────────────────────────────────────────────────────────
     private MeshService meshService;
     private boolean isBound = false;
+
+    // ─── Connectivity banner ─────────────────────────────────────────────
+    private ConnectivityObserver connectivityObserver;
+    private TextView connectivityBanner;
+    private final Handler bannerHandler = new Handler(Looper.getMainLooper());
+    /** Null until the first callback fires — used to detect the "back online" transition. */
+    private ConnectivityObserver.NetworkState lastKnownNetworkState = null;
 
     // ─── Navigation ─────────────────────────────────────────────────────
     private BottomNavigationView bottomNav;
@@ -112,7 +124,26 @@ public class MainActivity extends AppCompatActivity {
         ViewCompat.setOnApplyWindowInsetsListener(findViewById(R.id.main), (v, insets) -> {
             Insets bars = insets.getInsets(WindowInsetsCompat.Type.systemBars());
             v.setPadding(bars.left, bars.top, bars.right, 0);
+            // Push the bottom nav above the system navigation bar
+            BottomNavigationView nav = findViewById(R.id.bottomNav);
+            nav.setPadding(0, 0, 0, bars.bottom);
             return insets;
+        });
+
+        connectivityBanner = findViewById(R.id.connectivityBanner);
+        connectivityObserver = new ConnectivityObserver(this, new ConnectivityObserver.Listener() {
+            @Override
+            public void onNetworkStateChanged(ConnectivityObserver.NetworkState state,
+                                              String transport) {
+                updateConnectivityBanner(state, transport);
+            }
+            @Override
+            public void onEventLogged(ConnectivityObserver.Event event) { /* handled by NetworkFragment */ }
+        });
+
+        // Fetch (or refresh) this device's FCM token
+        FirebaseMessaging.getInstance().getToken().addOnSuccessListener(token -> {
+            if (token != null) FcmTokenManager.saveOwnToken(this, token);
         });
 
         setupBottomNavigation();
@@ -122,6 +153,19 @@ public class MainActivity extends AppCompatActivity {
         conversationMessages.put(Conversation.GROUP_ID, new ArrayList<>());
 
         checkPermissions();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        connectivityObserver.start();
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        connectivityObserver.stop();
+        bannerHandler.removeCallbacksAndMessages(null);
     }
 
     @Override
@@ -138,9 +182,54 @@ public class MainActivity extends AppCompatActivity {
         // If ChatFragment is on back stack, pop it and restore bottom nav
         if (getSupportFragmentManager().getBackStackEntryCount() > 0) {
             getSupportFragmentManager().popBackStack();
-            bottomNav.setVisibility(android.view.View.VISIBLE);
+            bottomNav.setVisibility(View.VISIBLE);
         } else {
             super.onBackPressed();
+        }
+    }
+
+    // ─── Connectivity banner ─────────────────────────────────────────────
+
+    /**
+     * Shows or hides the global connectivity banner based on network state.
+     *
+     * ACTIVE  → "Back online · WiFi"  (green, auto-hides after 3 s)
+     *           Only shown if the user was previously offline.
+     * IDLE    → "No internet connection"  (red, stays visible)
+     * CONNECTED → "Connecting…"  (orange, stays visible until validated)
+     */
+    private void updateConnectivityBanner(ConnectivityObserver.NetworkState state,
+                                          String transport) {
+        bannerHandler.removeCallbacksAndMessages(null);
+
+        boolean wasOffline = lastKnownNetworkState != null
+                && lastKnownNetworkState != ConnectivityObserver.NetworkState.ACTIVE;
+        lastKnownNetworkState = state;
+
+        switch (state) {
+            case ACTIVE:
+                if (wasOffline) {
+                    connectivityBanner.setText("Online  \u00B7  " + transport);
+                    connectivityBanner.setBackgroundColor(0xFF2E7D32);
+                    connectivityBanner.setVisibility(View.VISIBLE);
+                    bannerHandler.postDelayed(
+                            () -> connectivityBanner.setVisibility(View.GONE), 3000);
+                } else {
+                    connectivityBanner.setVisibility(View.GONE);
+                }
+                break;
+
+            case IDLE:
+                connectivityBanner.setText("No internet connection");
+                connectivityBanner.setBackgroundColor(0xFFC62828);
+                connectivityBanner.setVisibility(View.VISIBLE);
+                break;
+
+            case CONNECTED:
+                connectivityBanner.setText("Connecting...");
+                connectivityBanner.setBackgroundColor(0xFFE65100);
+                connectivityBanner.setVisibility(View.VISIBLE);
+                break;
         }
     }
 

@@ -145,13 +145,14 @@ public class Message implements Serializable {
 
     /**
      * Creates a handshake message to be sent immediately on connection.
-     * Content: "username|nodeUUID"
+     * Content: "username|nodeUUID|fcmToken"  (fcmToken may be empty string if unavailable)
      */
-    public static Message createHandshake(String username, String nodeId) {
+    public static Message createHandshake(String username, String nodeId, String fcmToken) {
         Message m = new Message("", SUBTYPE_HANDSHAKE);
         m.id = UUID.randomUUID().toString();
         m.subType = SUBTYPE_HANDSHAKE;
-        m.content = username + "|" + nodeId;
+        String token = (fcmToken != null) ? fcmToken : "";
+        m.content = username + "|" + nodeId + "|" + token;
         m.senderId = nodeId;
         m.senderName = username;
         m.channelType = CHANNEL_BROADCAST;

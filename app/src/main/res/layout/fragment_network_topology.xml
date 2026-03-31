@@ -16,9 +16,9 @@
         android:orientation="horizontal"
         android:gravity="center_vertical"
         android:paddingStart="20dp"
-        android:paddingEnd="20dp"
-        android:paddingTop="20dp"
-        android:paddingBottom="16dp"
+        android:paddingEnd="16dp"
+        android:paddingTop="24dp"
+        android:paddingBottom="18dp"
         app:layout_constraintTop_toTopOf="parent"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent">
@@ -32,10 +32,21 @@
             <TextView
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
+                android:text="MESHCHAT"
+                android:textSize="11sp"
+                android:textColor="#80FFFFFF"
+                android:textAllCaps="true"
+                android:letterSpacing="0.15" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
                 android:text="@string/nav_network"
-                android:textSize="22sp"
+                android:textSize="26sp"
                 android:textStyle="bold"
-                android:textColor="@android:color/white" />
+                android:textColor="@android:color/white"
+                android:letterSpacing="-0.01"
+                android:layout_marginTop="2dp" />
 
             <TextView
                 android:id="@+id/networkNameLabel"
@@ -43,22 +54,24 @@
                 android:layout_height="wrap_content"
                 android:text="—"
                 android:textSize="13sp"
-                android:textColor="#B2DFDB"
+                android:textColor="@color/textOnPrimaryMuted"
                 android:layout_marginTop="2dp" />
         </LinearLayout>
 
         <com.google.android.material.button.MaterialButton
             android:id="@+id/leaveNetworkButton"
             android:layout_width="wrap_content"
-            android:layout_height="36dp"
+            android:layout_height="40dp"
             android:text="@string/leave"
-            android:textSize="12sp"
+            android:textSize="13sp"
             android:textColor="@android:color/white"
             app:backgroundTint="#C62828"
-            app:cornerRadius="18dp" />
+            app:cornerRadius="20dp"
+            android:paddingStart="18dp"
+            android:paddingEnd="18dp" />
     </LinearLayout>
 
-    <!-- Stats row -->
+    <!-- Stats row: two distinct tiles -->
     <LinearLayout
         android:id="@+id/statsRow"
         android:layout_width="0dp"
@@ -66,28 +79,26 @@
         android:orientation="horizontal"
         android:background="@color/cardBackground"
         android:elevation="2dp"
-        android:paddingStart="16dp"
-        android:paddingEnd="16dp"
-        android:paddingTop="12dp"
-        android:paddingBottom="12dp"
         app:layout_constraintTop_toBottomOf="@id/topologyHeader"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent">
 
-        <!-- Nodes stat -->
+        <!-- Connected nodes tile -->
         <LinearLayout
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
             android:orientation="vertical"
-            android:gravity="center">
+            android:gravity="center"
+            android:paddingTop="20dp"
+            android:paddingBottom="20dp">
 
             <TextView
                 android:id="@+id/statNodes"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:text="0"
-                android:textSize="28sp"
+                android:textSize="36sp"
                 android:textStyle="bold"
                 android:textColor="@color/colorPrimary" />
 
@@ -95,24 +106,35 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:text="Connected"
-                android:textSize="11sp"
-                android:textColor="#9E9E9E" />
+                android:textSize="12sp"
+                android:textColor="@color/textSecondary"
+                android:layout_marginTop="2dp" />
         </LinearLayout>
 
-        <!-- Queued stat -->
+        <!-- Vertical divider -->
+        <View
+            android:layout_width="1dp"
+            android:layout_height="match_parent"
+            android:background="@color/dividerColor"
+            android:layout_marginTop="16dp"
+            android:layout_marginBottom="16dp" />
+
+        <!-- Queued messages tile -->
         <LinearLayout
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
             android:orientation="vertical"
-            android:gravity="center">
+            android:gravity="center"
+            android:paddingTop="20dp"
+            android:paddingBottom="20dp">
 
             <TextView
                 android:id="@+id/statQueued"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:text="0"
-                android:textSize="28sp"
+                android:textSize="36sp"
                 android:textStyle="bold"
                 android:textColor="@color/colorAccent" />
 
@@ -120,12 +142,13 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:text="Queued"
-                android:textSize="11sp"
-                android:textColor="#9E9E9E" />
+                android:textSize="12sp"
+                android:textColor="@color/textSecondary"
+                android:layout_marginTop="2dp" />
         </LinearLayout>
     </LinearLayout>
 
-    <!-- Topology canvas (filled programmatically) -->
+    <!-- Topology canvas -->
     <FrameLayout
         android:id="@+id/topologyContainer"
         android:layout_width="0dp"
@@ -142,7 +165,7 @@
         android:layout_width="0dp"
         android:layout_height="wrap_content"
         app:cardCornerRadius="0dp"
-        app:cardElevation="4dp"
+        app:cardElevation="6dp"
         android:layout_margin="0dp"
         app:layout_constraintBottom_toBottomOf="parent"
         app:layout_constraintStart_toStartOf="parent"
@@ -152,7 +175,10 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:orientation="vertical"
-            android:padding="16dp">
+            android:paddingStart="20dp"
+            android:paddingEnd="20dp"
+            android:paddingTop="16dp"
+            android:paddingBottom="16dp">
 
             <LinearLayout
                 android:layout_width="match_parent"
@@ -167,7 +193,7 @@
                     android:text="@string/direct_link_distance"
                     android:textSize="14sp"
                     android:textStyle="bold"
-                    android:textColor="#212121" />
+                    android:textColor="@color/textPrimary" />
 
                 <TextView
                     android:id="@+id/rssiValueLabel"
@@ -184,8 +210,9 @@
                 android:layout_height="wrap_content"
                 android:text="@string/rssi_hint"
                 android:textSize="12sp"
-                android:textColor="#9E9E9E"
-                android:layout_marginBottom="4dp" />
+                android:textColor="@color/textHint"
+                android:layout_marginTop="2dp"
+                android:layout_marginBottom="6dp" />
 
             <com.google.android.material.slider.Slider
                 android:id="@+id/rssiSlider"

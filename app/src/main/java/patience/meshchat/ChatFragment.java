@@ -10,6 +10,9 @@ import android.widget.TextView;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
+import androidx.core.graphics.Insets;
+import androidx.core.view.ViewCompat;
+import androidx.core.view.WindowInsetsCompat;
 import androidx.fragment.app.Fragment;
 import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
@@ -98,6 +101,16 @@ public class ChatFragment extends Fragment {
         backButton = view.findViewById(R.id.backButton);
 
         convTitle.setText(conversationName);
+
+        // Push the input bar above the system navigation bar
+        View inputBar = view.findViewById(R.id.inputBar);
+        final int originalBottomPadding = inputBar.getPaddingBottom();
+        ViewCompat.setOnApplyWindowInsetsListener(inputBar, (v, insets) -> {
+            Insets bars = insets.getInsets(WindowInsetsCompat.Type.systemBars());
+            v.setPadding(v.getPaddingLeft(), v.getPaddingTop(),
+                    v.getPaddingRight(), originalBottomPadding + bars.bottom);
+            return insets;
+        });
 
         LinearLayoutManager lm = new LinearLayoutManager(requireContext());
         lm.setStackFromEnd(true);

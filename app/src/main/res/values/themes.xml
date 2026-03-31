@@ -1,5 +1,5 @@
 <resources xmlns:tools="http://schemas.android.com/tools">
-    <style name="Base.Theme.MeshChat" parent="Theme.Material3.DayNight.NoActionBar">
+    <style name="Base.Theme.MeshChat" parent="Theme.Material3.Light.NoActionBar">
         <item name="colorPrimary">@color/colorPrimary</item>
         <item name="colorPrimaryDark">@color/colorPrimaryDark</item>
         <item name="colorAccent">@color/colorAccent</item>
@@ -9,17 +9,42 @@
 
     <style name="Theme.MeshChat" parent="Base.Theme.MeshChat" />
 
-    <!-- Registration screen button style -->
+    <!-- Primary filled button — pill shape -->
     <style name="MeshButton" parent="Widget.Material3.Button">
         <item name="android:textColor">#FFFFFF</item>
         <item name="backgroundTint">@color/colorPrimary</item>
-        <item name="cornerRadius">24dp</item>
+        <item name="cornerRadius">28dp</item>
+        <item name="android:letterSpacing">0.01</item>
     </style>
 
-    <!-- Outlined button for secondary actions -->
+    <!-- Outlined secondary button — pill shape -->
     <style name="MeshButtonOutlined" parent="Widget.Material3.Button.OutlinedButton">
         <item name="strokeColor">@color/colorPrimary</item>
         <item name="android:textColor">@color/colorPrimary</item>
-        <item name="cornerRadius">24dp</item>
+        <item name="cornerRadius">28dp</item>
+    </style>
+
+    <!-- Danger / destructive button -->
+    <style name="MeshButtonDanger" parent="Widget.Material3.Button">
+        <item name="android:textColor">#FFFFFF</item>
+        <item name="backgroundTint">#C62828</item>
+        <item name="cornerRadius">28dp</item>
+    </style>
+
+    <!-- Standard card style -->
+    <style name="MeshCard" parent="Widget.Material3.CardView.Elevated">
+        <item name="cardCornerRadius">14dp</item>
+        <item name="cardElevation">2dp</item>
+        <item name="android:layout_marginBottom">10dp</item>
+    </style>
+
+    <!-- Section label (all-caps, muted) -->
+    <style name="SectionLabel">
+        <item name="android:textSize">11sp</item>
+        <item name="android:textColor">@color/textSecondary</item>
+        <item name="android:textStyle">bold</item>
+        <item name="android:textAllCaps">true</item>
+        <item name="android:letterSpacing">0.12</item>
+        <item name="android:layout_marginBottom">10dp</item>
     </style>
 </resources>
