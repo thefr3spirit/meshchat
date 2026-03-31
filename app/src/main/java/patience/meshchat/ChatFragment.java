@@ -10,17 +10,20 @@ import android.widget.TextView;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
+import androidx.compose.ui.platform.ComposeView;
 import androidx.core.graphics.Insets;
 import androidx.core.view.ViewCompat;
 import androidx.core.view.WindowInsetsCompat;
 import androidx.fragment.app.Fragment;
-import androidx.recyclerview.widget.LinearLayoutManager;
-import androidx.recyclerview.widget.RecyclerView;
+import androidx.lifecycle.ViewModelProvider;
 
 import com.google.android.material.snackbar.Snackbar;
 
 import java.util.ArrayList;
 import java.util.List;
+
+import patience.meshchat.ui.ChatViewModel;
+import patience.meshchat.ui.MessageListScreenKt;
 
 /**
  * ChatFragment — the actual messaging screen for a single conversation.
@@ -43,13 +46,13 @@ public class ChatFragment extends Fragment {
     public static final String ARG_IS_GROUP = "is_group";
     public static final String ARG_PEER_ID = "peer_id";
 
-    private RecyclerView recyclerMessages;
+    private ComposeView composeMessageList;
     private EditText messageInput;
     private ImageButton sendButton;
     private TextView convTitle, statusText;
     private View backButton;
 
-    private MessageAdapter messageAdapter;
+    private ChatViewModel chatViewModel;
     private final List<Message> messages = new ArrayList<>();
 
     private String conversationId;
@@ -93,7 +96,7 @@ public class ChatFragment extends Fragment {
     public void onViewCreated(@NonNull View view, @Nullable Bundle savedInstanceState) {
         super.onViewCreated(view, savedInstanceState);
 
-        recyclerMessages = view.findViewById(R.id.recyclerMessages);
+        composeMessageList = view.findViewById(R.id.composeMessageList);
         messageInput = view.findViewById(R.id.messageInput);
         sendButton = view.findViewById(R.id.sendButton);
         convTitle = view.findViewById(R.id.convTitle);
@@ -112,11 +115,16 @@ public class ChatFragment extends Fragment {
             return insets;
         });
 
-        LinearLayoutManager lm = new LinearLayoutManager(requireContext());
-        lm.setStackFromEnd(true);
-        messageAdapter = new MessageAdapter(messages);
-        recyclerMessages.setLayoutManager(lm);
-        recyclerMessages.setAdapter(messageAdapter);
+        // Initialize ChatViewModel and wire up the Compose message list
+        chatViewModel = new ViewModelProvider(this).get(ChatViewModel.class);
+
+        composeMessageList.setContent(() -> {
+            MessageListScreenKt.MessageListScreen(
+                    chatViewModel.observeMessages(conversationId),
+                    androidx.compose.ui.Modifier.INSTANCE
+            );
+            return kotlin.Unit.INSTANCE;
+        });
 
         sendButton.setOnClickListener(v -> sendMessage());
         if (backButton != null) {
@@ -143,9 +151,9 @@ public class ChatFragment extends Fragment {
                     ((MainActivity) requireActivity()).getMessagesForConversation(conversationId);
             messages.clear();
             messages.addAll(existing);
-            messageAdapter.notifyDataSetChanged();
-            if (!messages.isEmpty()) {
-                recyclerMessages.scrollToPosition(messages.size() - 1);
+            // Persist existing messages into Room so the Compose UI can observe them
+            for (Message msg : existing) {
+                chatViewModel.insertMessage(msg, conversationId);
             }
         }
     }
@@ -195,14 +203,9 @@ public class ChatFragment extends Fragment {
                 if (getActivity() == null) return;
                 getActivity().runOnUiThread(() -> {
                     ((MainActivity) requireActivity()).handleDeliveryStatus(messageId);
-                    // Update delivery indicator in this chat
-                    for (int i = 0; i < messages.size(); i++) {
-                        if (messages.get(i).getId().equals(messageId)) {
-                            messages.get(i).setDeliveryStatus(Message.DELIVERY_DELIVERED);
-                            messageAdapter.notifyItemChanged(i);
-                            break;
-                        }
-                    }
+                    // Update delivery indicator via Room — Compose auto-recomposes
+                    chatViewModel.updateDeliveryStatus(messageId,
+                            patience.meshchat.ui.MessageStatus.Delivered.INSTANCE);
                 });
             }
 
@@ -238,8 +241,8 @@ public class ChatFragment extends Fragment {
 
     private void addMessage(Message message) {
         messages.add(message);
-        messageAdapter.notifyItemInserted(messages.size() - 1);
-        recyclerMessages.smoothScrollToPosition(messages.size() - 1);
+        // Insert into Room — the Compose UI auto-updates via collectAsState()
+        chatViewModel.insertMessage(message, conversationId);
         // Also store in MainActivity
         if (getActivity() instanceof MainActivity) {
             ((MainActivity) requireActivity()).storeMessage(conversationId, message);
@@ -265,10 +268,9 @@ public class ChatFragment extends Fragment {
 
         Message message = new Message(text, Message.TYPE_SENT, username);
 
-        // Add to local display immediately
+        // Insert into Room — Compose message list auto-updates via collectAsState()
         messages.add(message);
-        messageAdapter.notifyItemInserted(messages.size() - 1);
-        recyclerMessages.smoothScrollToPosition(messages.size() - 1);
+        chatViewModel.insertMessage(message, conversationId);
         messageInput.setText("");
 
         // Store in MainActivity
