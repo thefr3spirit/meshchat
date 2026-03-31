@@ -26,6 +26,7 @@ import android.util.Log;
 
 import androidx.core.content.ContextCompat;
 
+import patience.meshchat.gossip.GossipManager;
 import patience.meshchat.transport.CompositeTransport;
 import patience.meshchat.transport.MeshTransport;
 
@@ -209,6 +210,13 @@ public class MeshManager {
 
     /** Persistent message queue — survives app restarts and process death */
     private StoreAndForwardManager storeAndForwardManager;
+
+    /**
+     * Gossip anti-entropy manager — ensures eventual consistency.
+     * Periodically broadcasts Bloom filters of received message IDs;
+     * peers compare and push missing messages.
+     */
+    private GossipManager gossipManager;
 
     // ─── Power management state ───────────────────────────────────
 
@@ -400,6 +408,25 @@ public class MeshManager {
         this.e2eCryptoManager = new E2ECryptoManager(context);
         this.storeAndForwardManager = new StoreAndForwardManager(context);
         this.storeAndForwardManager.setDeliveryCallback(this::deliverStoredMessage);
+
+        // Gossip protocol for eventual consistency
+        this.gossipManager = new GossipManager(context, myNodeId);
+        this.gossipManager.start(new GossipManager.GossipCallback() {
+            @Override
+            public void sendToAllPeers(Message message, String excludeAddress) {
+                MeshManager.this.sendToAllPeers(message, excludeAddress);
+            }
+
+            @Override
+            public void sendToPeer(String peerAddress, Message message) {
+                MeshManager.this.sendToNode(peerAddress, message);
+            }
+
+            @Override
+            public String getUsername() {
+                return username;
+            }
+        });
 
         initialize();
     }
@@ -1308,6 +1335,9 @@ public class MeshManager {
 
         processedMessages.add(message.getId());
 
+        // Record in gossip seen-set for anti-entropy
+        gossipManager.recordMessage(message.getId(), message);
+
         Message networkCopy = message.copy();
         networkCopy.setContent(cryptoManager.encrypt(message.getContent()));
         networkCopy.setEncrypted(true);
@@ -1499,9 +1529,18 @@ public class MeshManager {
             return;
         }
 
+        // ── Gossip anti-entropy: Bloom filter & message request ──
+        if (message.getSubType() == Message.SUBTYPE_BLOOM_FILTER) {
+            gossipManager.handleBloomFilter(message, sourceAddress);
+            return;
+        }
+
         // ── Deduplication ──
         if (processedMessages.contains(message.getId())) return;
         processedMessages.add(message.getId());
+
+        // ── Record in gossip seen-set for anti-entropy ──
+        gossipManager.recordMessage(message.getId(), message);
 
         // ── TTL check ──
         if (message.isExpired()) {
@@ -1954,6 +1993,11 @@ public class MeshManager {
         // Store & Forward cleanup
         if (storeAndForwardManager != null) {
             storeAndForwardManager.shutdown();
+        }
+
+        // Gossip anti-entropy cleanup
+        if (gossipManager != null) {
+            gossipManager.shutdown();
         }
 
         Log.d(TAG, "MeshManager cleaned up.");
