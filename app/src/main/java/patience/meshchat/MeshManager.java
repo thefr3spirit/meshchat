@@ -45,17 +45,18 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
 /**
- * MeshManager — Bluetooth + WiFi Direct mesh networking engine.
+ * MeshManager — Bluetooth + WiFi Direct + BLE mesh networking engine.
  *
  * Responsibilities:
- *  1. PEER DISCOVERY    — Scans for Bluetooth devices and WiFi Direct peers
+ *  1. PEER DISCOVERY    — Scans via BT Classic, WiFi Direct, and BLE advertisements
  *  2. CONNECTIONS       — RFCOMM (Bluetooth) + TCP (WiFi Direct) connections
  *  3. MESSAGE ROUTING   — Broadcast and private (addressed) message routing
- *  4. ENCRYPTION        — AES-256-GCM via CryptoManager
+ *  4. ENCRYPTION        — AES-256-GCM (shared) + ECIES/X25519 (E2E)
  *  5. OFFLINE QUEUING   — Per-recipient queues, flushed on reconnect
  *  6. IDENTITY          — Handshake protocol to exchange usernames and UUIDs
  *  7. DISTANCE CONTROL  — RSSI threshold determines whether to auto-connect
  *  8. WIFI DIRECT       — Group Owner discovery and group formation
+ *  9. BLE ADVERTISING   — Dead-zone discovery via BLE ads + WiFi Direct handoff
  *
  * NETWORK NAMING:
  * ──────────────
@@ -167,6 +168,14 @@ public class MeshManager {
 
     private BluetoothAdapter bluetoothAdapter;
     private BluetoothServerThread bluetoothServerThread;
+
+    // ─── BLE Advertising (dead-zone discovery) ──────────────────────
+
+    /** BLE advertiser/scanner for dead-zone peer discovery */
+    private BleAdvertiser bleAdvertiser;
+
+    /** Our WiFi Direct MAC address (learned when this device info changes) */
+    private volatile String myWifiDirectMac;
 
     // ─── WiFi Direct ────────────────────────────────────────────────────
 
@@ -350,6 +359,7 @@ public class MeshManager {
         bluetoothAdapter = BluetoothAdapter.getDefaultAdapter();
         if (bluetoothAdapter != null) {
             setupBluetooth();
+            setupBleAdvertiser();
         }
         initializeWifiDirect();
         registerReceivers();
@@ -378,6 +388,56 @@ public class MeshManager {
     private String buildBtName(String networkName) {
         String full = BT_PREFIX + networkName;
         return full.length() > BT_NAME_MAX ? full.substring(0, BT_NAME_MAX) : full;
+    }
+
+    // ─── BLE advertiser setup ───────────────────────────────────────────
+
+    /**
+     * Initialises the BLE advertiser/scanner for dead-zone peer discovery.
+     *
+     * In dead zones (no WiFi AP, no cellular), BLE advertisements allow
+     * nearby devices to discover each other and exchange WiFi Direct MAC
+     * addresses. The scanning device then uses the MAC to initiate a
+     * WiFi Direct connection — handing off from BLE (discovery) to
+     * WiFi Direct (data transfer).
+     *
+     * The BLE advertisement payload contains:
+     *   - Our WiFi Direct MAC address (so peers can connect to us)
+     *   - Our mesh Node ID prefix (so peers can identify us)
+     */
+    private void setupBleAdvertiser() {
+        bleAdvertiser = new BleAdvertiser(context, bluetoothAdapter);
+        bleAdvertiser.setListener(this::onPeerDiscoveredViaBle);
+
+        // Start scanning immediately — we're always listening for peers
+        bleAdvertiser.startScanning();
+
+        // Advertising starts once we learn our WiFi Direct MAC (see
+        // WIFI_P2P_THIS_DEVICE_CHANGED_ACTION in wifiDirectReceiver)
+    }
+
+    /**
+     * Called by BleAdvertiser when a MeshChat peer is discovered via BLE.
+     *
+     * Extracts the WiFi Direct MAC address from the BLE advertisement
+     * and initiates a WiFi Direct connection to the discovered peer.
+     * This is the "BLE → WiFi Direct handoff" that enables dead-zone
+     * mesh formation.
+     *
+     * @param wifiDirectMac The peer's WiFi Direct MAC address
+     * @param nodeIdPrefix  First 8 bytes of the peer's mesh node UUID (hex)
+     * @param rssi          BLE signal strength in dBm
+     */
+    private void onPeerDiscoveredViaBle(String wifiDirectMac, String nodeIdPrefix, int rssi) {
+        Log.d(TAG, "BLE discovery → WiFi Direct handoff: MAC=" + wifiDirectMac
+                + " nodeId=" + nodeIdPrefix + " RSSI=" + rssi);
+
+        // Skip if it's our own advertisement or already connected
+        if (wifiDirectMac.equals(myWifiDirectMac)) return;
+        if (wifiDirectConnectedNodes.contains(wifiDirectMac)) return;
+
+        // Initiate WiFi Direct connection to the BLE-discovered peer
+        connectWifiDirectPeer(wifiDirectMac);
     }
 
     // ─── WiFi Direct setup ──────────────────────────────────────────────
@@ -553,6 +613,18 @@ public class MeshManager {
                     if (device != null) {
                         Log.d(TAG, "This device P2P status: "
                                 + deviceStatusToString(device.status));
+
+                        // Capture our WiFi Direct MAC address and start BLE
+                        // advertising so nearby devices (in dead zones) can
+                        // discover our WiFi Direct address via BLE and initiate
+                        // a WiFi Direct connection to us.
+                        String wdMac = device.deviceAddress;
+                        if (wdMac != null && !wdMac.isEmpty()) {
+                            myWifiDirectMac = wdMac;
+                            if (bleAdvertiser != null) {
+                                bleAdvertiser.startAdvertising(wdMac, myNodeId);
+                            }
+                        }
                     }
                     break;
                 }
@@ -739,19 +811,32 @@ public class MeshManager {
     // ═══════════════════════════════════════════════════════════════════
 
     /**
-     * Starts a Bluetooth + WiFi Direct scan.
+     * Starts a Bluetooth + WiFi Direct + BLE scan.
      * Called by the UI and periodically by the scheduler.
+     *
+     * In dead zones (no WiFi AP, no cellular), the BLE scan is the primary
+     * discovery mechanism: it finds nearby MeshChat peers via BLE advertisements,
+     * extracts their WiFi Direct MAC addresses, and initiates WiFi Direct
+     * connections automatically.
      */
     public void startDiscovery() {
         discoveredPeers.clear();
 
-        // ── Bluetooth discovery ─────────────────────────────────────────
+        // ── Bluetooth Classic discovery ─────────────────────────────────
         try {
             if (bluetoothAdapter != null && !bluetoothAdapter.isDiscovering()) {
                 bluetoothAdapter.startDiscovery();
             }
         } catch (SecurityException e) {
             Log.w(TAG, "BT discovery permission denied: " + e.getMessage());
+        }
+
+        // ── BLE scanning (dead-zone discovery) ──────────────────────────
+        // BLE scanning runs continuously, but we restart it here in case
+        // it was stopped or failed. BLE advertisements carry WiFi Direct
+        // MAC addresses, enabling connection even without any infrastructure.
+        if (bleAdvertiser != null && !bleAdvertiser.isScanning()) {
+            bleAdvertiser.startScanning();
         }
 
         // ── WiFi Direct discovery ───────────────────────────────────────
@@ -1556,6 +1641,11 @@ public class MeshManager {
         }
         if (wifiP2pManager != null && wifiP2pChannel != null) {
             wifiP2pManager.removeGroup(wifiP2pChannel, null);
+        }
+
+        // BLE cleanup
+        if (bleAdvertiser != null) {
+            bleAdvertiser.cleanup();
         }
 
         Log.d(TAG, "MeshManager cleaned up.");
