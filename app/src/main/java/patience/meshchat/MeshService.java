@@ -12,6 +12,11 @@ import android.os.IBinder;
 
 import androidx.annotation.Nullable;
 import androidx.core.app.NotificationCompat;
+import androidx.work.ExistingPeriodicWorkPolicy;
+import androidx.work.PeriodicWorkRequest;
+import androidx.work.WorkManager;
+
+import java.util.concurrent.TimeUnit;
 
 /**
  * ============================================================================
@@ -108,6 +113,9 @@ public class MeshService extends Service {
         // Begin scanning for nearby mesh devices
         meshManager.startDiscovery();
 
+        // Schedule periodic message expiry (every 6 hours)
+        scheduleMessageExpiry();
+
         return START_STICKY; // Auto-restart if killed
     }
 
@@ -130,6 +138,28 @@ public class MeshService extends Service {
     @Override
     public IBinder onBind(Intent intent) {
         return binder;
+    }
+
+    /**
+     * Schedules a periodic WorkManager task that cleans up expired messages.
+     *
+     * Runs every 6 hours to:
+     *   1. Delete queued messages older than 24 hours
+     *   2. Remove already-delivered messages
+     *   3. Reset FAILED messages for retry
+     *
+     * KEEP policy means: if the work is already scheduled, don't create
+     * a duplicate. This makes it safe to call on every service start.
+     */
+    private void scheduleMessageExpiry() {
+        PeriodicWorkRequest expiryWork = new PeriodicWorkRequest.Builder(
+                MessageExpiryWorker.class, 6, TimeUnit.HOURS)
+                .build();
+
+        WorkManager.getInstance(this).enqueueUniquePeriodicWork(
+                MessageExpiryWorker.WORK_NAME,
+                ExistingPeriodicWorkPolicy.KEEP,
+                expiryWork);
     }
 
     /**
