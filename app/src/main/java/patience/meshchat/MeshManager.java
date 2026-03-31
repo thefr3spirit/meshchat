@@ -146,6 +146,7 @@ public class MeshManager {
     private final Context context;
     private final SharedPreferences prefs;
     private final CryptoManager cryptoManager;
+    private final E2ECryptoManager e2eCryptoManager;
 
     /** This device's persistent UUID (generated once on install) */
     private final String myNodeId;
@@ -340,6 +341,7 @@ public class MeshManager {
         this.currentNetworkName = prefs.getString(KEY_NETWORK_NAME, null);
         this.rssiThreshold = prefs.getInt(KEY_RSSI_THRESHOLD, DEFAULT_RSSI_THRESHOLD);
         this.cryptoManager = new CryptoManager(DEFAULT_PASSPHRASE);
+        this.e2eCryptoManager = new E2ECryptoManager(context);
 
         initialize();
     }
@@ -989,6 +991,12 @@ public class MeshManager {
     /**
      * Sends a private message to a specific peer identified by their node UUID.
      *
+     * ENCRYPTION STRATEGY:
+     *   - If we have the recipient's E2E public key → use ECIES (X25519 + AES-GCM).
+     *     Only the recipient can decrypt. Relay nodes see only ciphertext.
+     *   - If we DON'T have their public key yet → fall back to shared-passphrase
+     *     encryption (CryptoManager). Less secure but still encrypted.
+     *
      * If the peer is directly connected, the message goes straight to them.
      * If not, we flood it to all connected peers so the mesh can relay it.
      * If nobody is connected, it's queued per-recipient.
@@ -1002,7 +1010,21 @@ public class MeshManager {
         processedMessages.add(message.getId());
 
         Message networkCopy = message.copy();
-        networkCopy.setContent(cryptoManager.encrypt(message.getContent()));
+
+        // E2E encryption (preferred): use recipient's X25519 public key
+        if (e2eCryptoManager.hasPeerKey(recipientId)) {
+            String e2eEncrypted = e2eCryptoManager.encryptForRecipient(
+                    message.getContent(), recipientId);
+            if (e2eEncrypted != null) {
+                networkCopy.setContent(e2eEncrypted);
+            } else {
+                // E2E failed — fall back to shared passphrase
+                networkCopy.setContent(cryptoManager.encrypt(message.getContent()));
+            }
+        } else {
+            // No E2E key available yet — use shared passphrase
+            networkCopy.setContent(cryptoManager.encrypt(message.getContent()));
+        }
         networkCopy.setEncrypted(true);
 
         String recipientMac = nodeIdToAddress.get(recipientId);
@@ -1097,6 +1119,10 @@ public class MeshManager {
             handleHeartbeat(message, sourceAddress);
             return;
         }
+        if (message.getSubType() == Message.SUBTYPE_KEY_ANNOUNCE) {
+            handleKeyAnnounce(message, sourceAddress);
+            return;
+        }
 
         // ── Deduplication ──
         if (processedMessages.contains(message.getId())) return;
@@ -1136,9 +1162,16 @@ public class MeshManager {
         }
 
         // ── Decrypt and deliver to UI ──
+        // Try E2E decryption first (for private messages encrypted with our
+        // public key), then fall back to shared-passphrase decryption.
         if (message.isEncrypted()) {
-            String decrypted = cryptoManager.decrypt(message.getContent());
-            message.setContent(decrypted);
+            String content = message.getContent();
+            if (E2ECryptoManager.isE2EEncrypted(content)) {
+                String decrypted = e2eCryptoManager.decrypt(content);
+                message.setContent(decrypted != null ? decrypted : "[E2E decryption failed]");
+            } else {
+                message.setContent(cryptoManager.decrypt(content));
+            }
             message.setEncrypted(false);
         }
         message.setType(Message.TYPE_RECEIVED);
@@ -1153,10 +1186,18 @@ public class MeshManager {
     /**
      * Sends our identity to a newly connected peer.
      * Must be called immediately after the ObjectOutputStream is ready.
+     *
+     * Handshake content format: "username|nodeUUID|fcmToken|e2ePublicKey"
+     * The E2E public key (X25519, Base64-encoded) is included so that the
+     * peer can encrypt private messages for us using ECIES, even if we
+     * are multiple hops apart later.
      */
     private void sendHandshake(ObjectOutputStream out) {
         String fcmToken = FcmTokenManager.getOwnToken(context);
         Message handshake = Message.createHandshake(username, myNodeId, fcmToken);
+        // Append E2E public key to handshake content
+        String e2ePubKey = e2eCryptoManager.getPublicKeyBase64();
+        handshake.setContent(handshake.getContent() + "|" + e2ePubKey);
         try {
             synchronized (out) {
                 out.writeObject(handshake);
@@ -1171,13 +1212,16 @@ public class MeshManager {
     /** Processes an incoming handshake, mapping the peer's UUID to their BT MAC */
     private void handleHandshake(Message message, String sourceMac) {
         String content = message.getContent();
-        // Format: "username|nodeUUID" (legacy) or "username|nodeUUID|fcmToken"
-        String[] parts = content.split("\\|", 3);
+        // Format: "username|nodeUUID|fcmToken|e2ePublicKey" (4 fields)
+        //   or:   "username|nodeUUID|fcmToken" (legacy, 3 fields)
+        //   or:   "username|nodeUUID" (legacy, 2 fields)
+        String[] parts = content.split("\\|", 4);
         if (parts.length < 2) return;
 
         String peerUsername = parts[0];
         String peerNodeId   = parts[1];
         String peerFcmToken = (parts.length >= 3 && !parts[2].isEmpty()) ? parts[2] : null;
+        String peerE2ePubKey = (parts.length >= 4 && !parts[3].isEmpty()) ? parts[3] : null;
 
         // Store bidirectional UUID ↔ MAC mapping
         nodeIdToAddress.put(peerNodeId, sourceMac);
@@ -1189,11 +1233,27 @@ public class MeshManager {
             FcmTokenManager.savePeerToken(context, peerNodeId, peerFcmToken);
         }
 
+        // Store peer's E2E public key for end-to-end encrypted private messages
+        if (peerE2ePubKey != null) {
+            e2eCryptoManager.storePeerPublicKey(peerNodeId, peerE2ePubKey);
+        }
+
         Log.d(TAG, "Handshake from " + peerUsername + " (" + peerNodeId + ") @ " + sourceMac);
         notifyNodeInfoUpdated();
 
         // Notify all OTHER connected peers that a new node joined
         new FcmNotificationSender(context).notifyPeersOfNewNode(peerUsername, peerNodeId);
+
+        // Gossip our own public key to the new peer's network region
+        broadcastKeyAnnounce();
+
+        // Gossip the new peer's public key so nodes beyond us learn it too
+        if (peerE2ePubKey != null) {
+            Message keyAnnounce = Message.createKeyAnnounce(
+                    peerUsername, peerNodeId, peerE2ePubKey);
+            processedMessages.add(keyAnnounce.getId());
+            sendToAllPeers(keyAnnounce, sourceMac);
+        }
 
         // Flush any queued private messages for this peer
         flushPerRecipientQueue(peerNodeId, sourceMac);
@@ -1243,6 +1303,62 @@ public class MeshManager {
 
         Log.d(TAG, "Heartbeat received from " + message.getSenderName()
                 + " (hop " + message.getHopCount() + ")");
+    }
+
+    // ─── Key Announce (E2E public key gossip) ───────────────────────────
+
+    /**
+     * Broadcasts our E2E public key to the mesh so that distant nodes
+     * (multiple hops away) can learn it and send us E2E-encrypted messages.
+     *
+     * Called after each handshake and can be triggered manually.
+     * The KEY_ANNOUNCE message is forwarded by all nodes (like a broadcast),
+     * with the same dedup/TTL/hop-count rules that prevent loops.
+     */
+    private void broadcastKeyAnnounce() {
+        String pubKey = e2eCryptoManager.getPublicKeyBase64();
+        if (pubKey.isEmpty()) return;
+
+        Message announce = Message.createKeyAnnounce(username, myNodeId, pubKey);
+        processedMessages.add(announce.getId());
+        sendToAllPeers(announce, null);
+        Log.d(TAG, "Broadcast own E2E public key to mesh");
+    }
+
+    /**
+     * Handles an incoming KEY_ANNOUNCE message.
+     *
+     * Stores the announced public key so we can send E2E-encrypted private
+     * messages to that node, even though they may be many hops away.
+     * Then forwards the announcement to other peers (gossip propagation).
+     */
+    private void handleKeyAnnounce(Message message, String sourceAddress) {
+        // ── Deduplication ──
+        if (processedMessages.contains(message.getId())) return;
+        processedMessages.add(message.getId());
+
+        // ── TTL check ──
+        if (message.isExpired()) return;
+
+        // ── Parse: "nodeUUID|publicKeyBase64" ──
+        String content = message.getContent();
+        String[] parts = content.split("\\|", 2);
+        if (parts.length < 2) return;
+
+        String peerNodeId = parts[0];
+        String peerPubKey = parts[1];
+
+        // Store the peer's E2E public key
+        e2eCryptoManager.storePeerPublicKey(peerNodeId, peerPubKey);
+
+        // ── Forward (gossip propagation) ──
+        if (message.canForward()) {
+            message.incrementHopCount();
+            sendToAllPeers(message, sourceAddress);
+        }
+
+        Log.d(TAG, "KEY_ANNOUNCE from " + message.getSenderName()
+                + " (" + peerNodeId + "), hop " + message.getHopCount());
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -1353,6 +1469,7 @@ public class MeshManager {
     public String getUsername() { return username; }
     public boolean isVisible() { return visible; }
     public CryptoManager getCryptoManager() { return cryptoManager; }
+    public E2ECryptoManager getE2ECryptoManager() { return e2eCryptoManager; }
 
     /**
      * Updates the RSSI threshold used for auto-connection decisions.

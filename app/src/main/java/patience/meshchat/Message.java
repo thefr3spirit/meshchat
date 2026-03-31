@@ -45,6 +45,13 @@ public class Message implements Serializable {
      */
     public static final int SUBTYPE_HEARTBEAT = 3;
 
+    /**
+     * Key Announce — gossip-propagated public key advertisement.
+     * Content format: "nodeUUID|publicKeyBase64"
+     * Allows nodes multiple hops apart to learn each other's E2E public keys.
+     */
+    public static final int SUBTYPE_KEY_ANNOUNCE = 4;
+
     // ─── Channel types ──────────────────────────────────────────────────
 
     /** Message is broadcast to everyone in the network */
@@ -170,6 +177,25 @@ public class Message implements Serializable {
     }
 
     /**
+     * Creates a key announcement message for gossip-propagating our
+     * E2E public key across the mesh network.
+     * Content: "nodeUUID|publicKeyBase64"
+     */
+    public static Message createKeyAnnounce(String username, String nodeId,
+                                            String publicKeyBase64) {
+        Message m = new Message("", TYPE_SENT);
+        m.id = UUID.randomUUID().toString();
+        m.subType = SUBTYPE_KEY_ANNOUNCE;
+        m.content = nodeId + "|" + publicKeyBase64;
+        m.senderId = nodeId;
+        m.senderName = username;
+        m.channelType = CHANNEL_BROADCAST;
+        m.encrypted = false;
+        m.ttlMs = m.timestamp + DEFAULT_TTL_MS;
+        return m;
+    }
+
+    /**
      * Creates a heartbeat message to broadcast liveness.
      * Content: "username|nodeUUID"
      */
@@ -242,10 +268,10 @@ public class Message implements Serializable {
     public boolean canForward() { return hopCount < MAX_HOPS; }
     public boolean isExpired() { return System.currentTimeMillis() > ttlMs; }
 
-    /** Whether this is a control frame (handshake, ACK, or heartbeat) rather than user content */
+    /** Whether this is a control frame (handshake, ACK, heartbeat, or key announce) rather than user content */
     public boolean isControlFrame() {
         return subType == SUBTYPE_HANDSHAKE || subType == SUBTYPE_ACK
-                || subType == SUBTYPE_HEARTBEAT;
+                || subType == SUBTYPE_HEARTBEAT || subType == SUBTYPE_KEY_ANNOUNCE;
     }
 
     public String getFormattedTime() {
