@@ -129,6 +129,18 @@ public class MeshManager {
     private static final int DISCOVERY_INTERVAL_SEC = 30;
     private static final String DEFAULT_PASSPHRASE = "MeshChat";
 
+    // ─── Heartbeat & stale peer eviction ────────────────────────────────
+
+    /** Heartbeat broadcast interval in seconds */
+    private static final int HEARTBEAT_INTERVAL_SEC = 20;
+
+    /**
+     * If no heartbeat (or any message) is received from a directly-connected
+     * peer within this many milliseconds, the peer is considered stale and
+     * is automatically disconnected.
+     */
+    private static final long STALE_PEER_TIMEOUT_MS = 90_000; // 90 seconds
+
     // ─── Core state ─────────────────────────────────────────────────────
 
     private final Context context;
@@ -270,6 +282,17 @@ public class MeshManager {
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private ScheduledExecutorService discoveryScheduler;
 
+    // ─── Heartbeat & liveness tracking ──────────────────────────────────
+
+    /** Scheduler for periodic heartbeat broadcasts and stale peer checks */
+    private ScheduledExecutorService heartbeatScheduler;
+
+    /**
+     * Tracks when we last received ANY message (including heartbeats) from
+     * each directly-connected peer.  Key = address (BT MAC or WiFi Direct IP).
+     */
+    private final Map<String, Long> lastSeenTimestamps = new ConcurrentHashMap<>();
+
     // ═══════════════════════════════════════════════════════════════════
     // CALLBACK INTERFACE
     // ═══════════════════════════════════════════════════════════════════
@@ -329,6 +352,7 @@ public class MeshManager {
         initializeWifiDirect();
         registerReceivers();
         startPeriodicDiscovery();
+        startHeartbeatScheduler();
     }
 
     // ─── Bluetooth setup ────────────────────────────────────────────────
@@ -752,6 +776,95 @@ public class MeshManager {
         );
     }
 
+    // ═══════════════════════════════════════════════════════════════════
+    // HEARTBEAT & STALE PEER EVICTION
+    // ═══════════════════════════════════════════════════════════════════
+
+    /**
+     * Starts two periodic tasks on a dedicated scheduler:
+     *   1. HEARTBEAT BROADCAST — every HEARTBEAT_INTERVAL_SEC seconds,
+     *      broadcasts a lightweight heartbeat message to all connected peers.
+     *      Each heartbeat carries our username and node UUID so that receivers
+     *      can update their last-seen timestamps.
+     *   2. STALE PEER CHECK — every HEARTBEAT_INTERVAL_SEC seconds (offset
+     *      by half the interval for even spacing), iterates all directly-
+     *      connected peers and evicts any that haven't been heard from
+     *      within STALE_PEER_TIMEOUT_MS.
+     */
+    private void startHeartbeatScheduler() {
+        heartbeatScheduler = Executors.newSingleThreadScheduledExecutor();
+
+        // ── Periodic heartbeat broadcast ────────────────────────────────
+        heartbeatScheduler.scheduleAtFixedRate(
+                this::broadcastHeartbeat,
+                HEARTBEAT_INTERVAL_SEC,
+                HEARTBEAT_INTERVAL_SEC,
+                TimeUnit.SECONDS
+        );
+
+        // ── Periodic stale peer eviction ────────────────────────────────
+        heartbeatScheduler.scheduleAtFixedRate(
+                this::evictStalePeers,
+                HEARTBEAT_INTERVAL_SEC + (HEARTBEAT_INTERVAL_SEC / 2),
+                HEARTBEAT_INTERVAL_SEC,
+                TimeUnit.SECONDS
+        );
+    }
+
+    /**
+     * Broadcasts a heartbeat message to all connected peers.
+     * Heartbeats are short-lived control frames (5-minute TTL) that are
+     * forwarded across the mesh like any broadcast, allowing multi-hop
+     * liveness detection.
+     */
+    private void broadcastHeartbeat() {
+        if (connectedNodes.isEmpty() && wifiDirectConnectedNodes.isEmpty()) return;
+
+        Message heartbeat = Message.createHeartbeat(username, myNodeId);
+        processedMessages.add(heartbeat.getId());
+        sendToAllPeers(heartbeat, null);
+        Log.d(TAG, "Heartbeat broadcast sent");
+    }
+
+    /**
+     * Checks all directly-connected peers and disconnects any that haven't
+     * sent a message (including heartbeats) within STALE_PEER_TIMEOUT_MS.
+     *
+     * This handles node churn: when a peer silently drops off the network
+     * (e.g. battery dies, walks out of range), the stale peer timeout
+     * ensures we clean up its resources and stop trying to route through it.
+     */
+    private void evictStalePeers() {
+        long now = System.currentTimeMillis();
+        for (Map.Entry<String, Long> entry : lastSeenTimestamps.entrySet()) {
+            String address = entry.getKey();
+            long lastSeen = entry.getValue();
+
+            // Only evict if the peer is still tracked as connected
+            if (!connectedNodes.contains(address)
+                    && !wifiDirectConnectedNodes.contains(address)) {
+                lastSeenTimestamps.remove(address);
+                continue;
+            }
+
+            if (now - lastSeen > STALE_PEER_TIMEOUT_MS) {
+                Log.w(TAG, "Evicting stale peer " + address
+                        + " (last seen " + ((now - lastSeen) / 1000) + "s ago)");
+                lastSeenTimestamps.remove(address);
+                notifyNodeDisconnected(address);
+            }
+        }
+    }
+
+    /**
+     * Records a liveness timestamp for a peer.
+     * Called whenever ANY message (chat, heartbeat, handshake, ACK) is received
+     * from a directly-connected peer.
+     */
+    private void updateLastSeen(String address) {
+        lastSeenTimestamps.put(address, System.currentTimeMillis());
+    }
+
     /** Returns the current list of discovered mesh networks */
     public List<Network> getDiscoveredNetworks() {
         return new ArrayList<>(discoveredNetworks.values());
@@ -968,13 +1081,20 @@ public class MeshManager {
      * @param sourceAddress BT MAC of the peer who sent it (for relay exclusion)
      */
     private void handleIncomingMessage(Message message, String sourceAddress) {
-        // ── Control frames (handshake / ACK) ──
+        // ── Update liveness timestamp for the direct peer ──
+        updateLastSeen(sourceAddress);
+
+        // ── Control frames (handshake / ACK / heartbeat) ──
         if (message.getSubType() == Message.SUBTYPE_HANDSHAKE) {
             handleHandshake(message, sourceAddress);
             return;
         }
         if (message.getSubType() == Message.SUBTYPE_ACK) {
             handleAck(message);
+            return;
+        }
+        if (message.getSubType() == Message.SUBTYPE_HEARTBEAT) {
+            handleHeartbeat(message, sourceAddress);
             return;
         }
 
@@ -1093,6 +1213,38 @@ public class MeshManager {
         }
     }
 
+    // ─── Heartbeat ──────────────────────────────────────────────────────
+
+    /**
+     * Processes an incoming heartbeat message.
+     *
+     * Heartbeats serve two purposes:
+     *   1. LIVENESS — updateLastSeen() was already called above, so the
+     *      peer's stale timer is refreshed.
+     *   2. MULTI-HOP FORWARDING — heartbeats are forwarded like broadcasts
+     *      so that nodes several hops away can still detect liveness of
+     *      distant peers.
+     *
+     * Heartbeats are NOT delivered to the UI (no onMessageReceived callback).
+     */
+    private void handleHeartbeat(Message message, String sourceAddress) {
+        // ── Deduplication (same LRU set as chat messages) ──
+        if (processedMessages.contains(message.getId())) return;
+        processedMessages.add(message.getId());
+
+        // ── TTL check ──
+        if (message.isExpired()) return;
+
+        // ── Forward to other peers (multi-hop liveness propagation) ──
+        if (message.canForward()) {
+            message.incrementHopCount();
+            sendToAllPeers(message, sourceAddress);
+        }
+
+        Log.d(TAG, "Heartbeat received from " + message.getSenderName()
+                + " (hop " + message.getHopCount() + ")");
+    }
+
     // ═══════════════════════════════════════════════════════════════════
     // OFFLINE QUEUES
     // ═══════════════════════════════════════════════════════════════════
@@ -1126,6 +1278,7 @@ public class MeshManager {
 
     private void notifyNodeConnected(String mac) {
         connectedNodes.add(mac);
+        updateLastSeen(mac); // initial liveness timestamp
         notifyNodeInfoUpdated();
         flushBroadcastQueue();
 
@@ -1138,6 +1291,7 @@ public class MeshManager {
     private void notifyNodeDisconnected(String mac) {
         connectedNodes.remove(mac);
         connectingNodes.remove(mac); // allow reconnection attempts after a drop
+        lastSeenTimestamps.remove(mac); // clean up liveness tracking
 
         // Bluetooth cleanup
         ObjectOutputStream out = bluetoothOutputStreams.remove(mac);
@@ -1260,6 +1414,9 @@ public class MeshManager {
     public void cleanup() {
         if (discoveryScheduler != null && !discoveryScheduler.isShutdown()) {
             discoveryScheduler.shutdownNow();
+        }
+        if (heartbeatScheduler != null && !heartbeatScheduler.isShutdown()) {
+            heartbeatScheduler.shutdownNow();
         }
         try { context.unregisterReceiver(bluetoothReceiver); } catch (Exception ignored) {}
         try { context.unregisterReceiver(wifiDirectReceiver); } catch (Exception ignored) {}
