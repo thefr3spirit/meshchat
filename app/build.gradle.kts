@@ -62,6 +62,7 @@ dependencies {
     implementation("org.osmdroid:osmdroid-android:6.1.18")
 
     implementation(libs.room.runtime)
+    implementation("androidx.room:room-ktx:2.6.1")
     annotationProcessor(libs.room.compiler)
     implementation(libs.work.runtime)
 
@@ -75,6 +76,10 @@ dependencies {
     implementation(libs.activity.compose)
     implementation(libs.lifecycle.runtime.compose)
     implementation(libs.lifecycle.viewmodel.compose)
+
+    // Hilt Dependency Injection
+    implementation(libs.hilt.android)
+    annotationProcessor(libs.hilt.compiler)
 
     testImplementation(libs.junit)
     androidTestImplementation(libs.ext.junit)
