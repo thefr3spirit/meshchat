@@ -313,15 +313,34 @@ public class BleAdvertiser {
      * compared to unfiltered scanning (the Bluetooth chipset can filter
      * in hardware on most devices).
      *
-     * Scan mode LOW_POWER reduces battery consumption at the cost of
-     * slightly longer discovery latency (~5s vs ~0.5s).
+     * Default scan mode is LOW_POWER — balances battery life against
+     * discovery latency. Use startScanning(int) to override.
      */
     public void startScanning() {
+        startScanning(ScanSettings.SCAN_MODE_LOW_POWER);
+    }
+
+    /**
+     * Starts BLE scanning with a specific scan mode.
+     *
+     * SCAN MODES (battery vs responsiveness trade-off):
+     *   - SCAN_MODE_LOW_POWER:   ~5s latency, minimal battery drain.
+     *     Use when the app is in the BACKGROUND.  (duty-cycle ~0.5%)
+     *   - SCAN_MODE_LOW_LATENCY: ~0.5s latency, highest battery drain.
+     *     Use when the app is in the FOREGROUND.  (continuous scan)
+     *   - SCAN_MODE_BALANCED:    ~2–3s latency, moderate drain.
+     *
+     * @param scanMode One of ScanSettings.SCAN_MODE_* constants
+     */
+    public void startScanning(int scanMode) {
         if (scanner == null) {
             Log.w(TAG, "Cannot scan: BluetoothLeScanner not available");
             return;
         }
-        if (isScanning) return;
+        if (isScanning) {
+            // If already scanning, stop and restart with the new mode
+            stopScanning();
+        }
         if (!hasPermission(Manifest.permission.BLUETOOTH_SCAN)) {
             Log.w(TAG, "BLUETOOTH_SCAN permission not granted");
             return;
@@ -335,15 +354,22 @@ public class BleAdvertiser {
             List<ScanFilter> filters = new ArrayList<>();
             filters.add(filter);
 
-            // ── ScanSettings: low power for battery efficiency ──────────────
+            // ── ScanSettings: mode determined by caller ─────────────────────
             ScanSettings settings = new ScanSettings.Builder()
-                    .setScanMode(ScanSettings.SCAN_MODE_LOW_POWER)
+                    .setScanMode(scanMode)
                     .setReportDelay(0) // Report results immediately
                     .build();
 
             scanner.startScan(filters, settings, scanCallback);
             isScanning = true;
-            Log.d(TAG, "BLE scanning started (filtering for MeshChat UUID)");
+
+            String modeName;
+            switch (scanMode) {
+                case ScanSettings.SCAN_MODE_LOW_LATENCY: modeName = "LOW_LATENCY"; break;
+                case ScanSettings.SCAN_MODE_BALANCED:    modeName = "BALANCED";     break;
+                default:                                 modeName = "LOW_POWER";    break;
+            }
+            Log.d(TAG, "BLE scanning started (mode=" + modeName + ")");
 
         } catch (SecurityException e) {
             Log.e(TAG, "BLE scan permission denied: " + e.getMessage());

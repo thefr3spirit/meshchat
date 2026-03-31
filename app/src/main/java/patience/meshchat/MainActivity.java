@@ -159,6 +159,12 @@ public class MainActivity extends AppCompatActivity {
     protected void onResume() {
         super.onResume();
         connectivityObserver.start();
+
+        // Notify MeshManager that the app is foregrounded — switch BLE to
+        // SCAN_MODE_LOW_LATENCY for faster peer discovery.
+        if (isBound && meshService != null && meshService.getMeshManager() != null) {
+            meshService.getMeshManager().setAppInForeground(true);
+        }
     }
 
     @Override
@@ -166,6 +172,12 @@ public class MainActivity extends AppCompatActivity {
         super.onPause();
         connectivityObserver.stop();
         bannerHandler.removeCallbacksAndMessages(null);
+
+        // Notify MeshManager that the app is backgrounded — switch BLE to
+        // SCAN_MODE_LOW_POWER to conserve battery.
+        if (isBound && meshService != null && meshService.getMeshManager() != null) {
+            meshService.getMeshManager().setAppInForeground(false);
+        }
     }
 
     @Override

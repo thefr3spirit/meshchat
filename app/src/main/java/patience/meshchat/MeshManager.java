@@ -5,6 +5,7 @@ import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothServerSocket;
 import android.bluetooth.BluetoothSocket;
+import android.bluetooth.le.ScanSettings;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
@@ -17,6 +18,7 @@ import android.net.wifi.p2p.WifiP2pDevice;
 import android.net.wifi.p2p.WifiP2pDeviceList;
 import android.net.wifi.p2p.WifiP2pInfo;
 import android.net.wifi.p2p.WifiP2pManager;
+import android.os.BatteryManager;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
@@ -58,6 +60,7 @@ import java.util.concurrent.TimeUnit;
  *  8. WIFI DIRECT       — Group Owner discovery and group formation
  *  9. BLE ADVERTISING   — Dead-zone discovery via BLE ads + WiFi Direct handoff
  * 10. STORE & FORWARD   — Room-persisted queue with BLE-triggered redelivery
+ * 11. POWER MANAGEMENT  — Duty-cycle scanning + battery-aware scan mode switching
  *
  * NETWORK NAMING:
  * ──────────────
@@ -131,6 +134,17 @@ public class MeshManager {
     private static final int DISCOVERY_INTERVAL_SEC = 30;
     private static final String DEFAULT_PASSPHRASE = "MeshChat";
 
+    // ─── Duty-cycle BLE scanning ────────────────────────────────────
+
+    /** BLE scan window: scan actively for this many milliseconds */
+    private static final long BLE_SCAN_WINDOW_MS = 2_000;   // 2 seconds
+
+    /** BLE scan pause: sleep between scan windows */
+    private static final long BLE_SCAN_PAUSE_MS = 8_000;    // 8 seconds
+
+    /** Battery level (%) below which we switch to aggressive power saving */
+    private static final int LOW_BATTERY_THRESHOLD = 20;
+
     // ─── Heartbeat & stale peer eviction ────────────────────────────────
 
     /** Heartbeat broadcast interval in seconds */
@@ -179,6 +193,17 @@ public class MeshManager {
 
     /** Persistent message queue — survives app restarts and process death */
     private StoreAndForwardManager storeAndForwardManager;
+
+    // ─── Power management state ───────────────────────────────────
+
+    /**
+     * Whether the app's Activity is in the foreground.
+     * Controls BLE scan mode: LOW_LATENCY (foreground) vs LOW_POWER (background).
+     */
+    private volatile boolean appInForeground = true;
+
+    /** Handler used for duty-cycle BLE scanning (scan 2s / pause 8s) */
+    private final Handler dutyCycleHandler = new Handler(Looper.getMainLooper());
 
     /** Our WiFi Direct MAC address (learned when this device info changes) */
     private volatile String myWifiDirectMac;
@@ -417,11 +442,114 @@ public class MeshManager {
         bleAdvertiser = new BleAdvertiser(context, bluetoothAdapter);
         bleAdvertiser.setListener(this::onPeerDiscoveredViaBle);
 
-        // Start scanning immediately — we're always listening for peers
-        bleAdvertiser.startScanning();
+        // Start duty-cycle BLE scanning (scan 2s, pause 8s)
+        startDutyCycleScanning();
 
         // Advertising starts once we learn our WiFi Direct MAC (see
         // WIFI_P2P_THIS_DEVICE_CHANGED_ACTION in wifiDirectReceiver)
+    }
+
+    /**
+     * Starts duty-cycle BLE scanning to balance discovery speed vs battery.
+     *
+     * DUTY-CYCLE PATTERN:
+     *   1. Scan for BLE_SCAN_WINDOW_MS (2 seconds) — actively looking for peers
+     *   2. Pause for BLE_SCAN_PAUSE_MS (8 seconds) — radio off, saving power
+     *   3. Repeat indefinitely
+     *
+     * This gives a 20% duty cycle (2s out of every 10s), which is a good
+     * compromise between finding peers quickly and preserving battery.
+     *
+     * SCAN MODE depends on foreground state:
+     *   - Foreground: SCAN_MODE_LOW_LATENCY (fastest discovery, higher drain)
+     *   - Background: SCAN_MODE_LOW_POWER   (slower discovery, minimal drain)
+     *
+     * On LOW BATTERY (&lt;20%): scan mode is always LOW_POWER regardless of
+     * foreground state, and we respect the duty cycle strictly.
+     */
+    private void startDutyCycleScanning() {
+        if (bleAdvertiser == null) return;
+
+        int scanMode = chooseScanMode();
+        bleAdvertiser.startScanning(scanMode);
+
+        // Schedule stop after the scan window (2s)
+        dutyCycleHandler.postDelayed(this::dutyCyclePause, BLE_SCAN_WINDOW_MS);
+    }
+
+    /**
+     * Pauses BLE scanning during the duty-cycle sleep phase.
+     * After the pause period, restarts scanning automatically.
+     */
+    private void dutyCyclePause() {
+        if (bleAdvertiser != null) {
+            bleAdvertiser.stopScanning();
+        }
+        // Schedule next scan window after the pause (8s)
+        dutyCycleHandler.postDelayed(this::startDutyCycleScanning, BLE_SCAN_PAUSE_MS);
+    }
+
+    /**
+     * Selects the BLE scan mode based on foreground state and battery level.
+     *
+     * Policy:
+     *   - Low battery (&lt;20%): always SCAN_MODE_LOW_POWER
+     *   - Foreground + sufficient battery: SCAN_MODE_LOW_LATENCY
+     *   - Background + sufficient battery: SCAN_MODE_LOW_POWER
+     *
+     * @return ScanSettings.SCAN_MODE_* constant
+     */
+    private int chooseScanMode() {
+        if (isBatteryLow()) {
+            return ScanSettings.SCAN_MODE_LOW_POWER;
+        }
+        return appInForeground
+                ? ScanSettings.SCAN_MODE_LOW_LATENCY
+                : ScanSettings.SCAN_MODE_LOW_POWER;
+    }
+
+    /**
+     * Checks if the device battery is below the low threshold (20%).
+     *
+     * Uses BatteryManager.getIntProperty() which is available from API 21+.
+     * Returns false if the battery level can't be determined.
+     */
+    private boolean isBatteryLow() {
+        BatteryManager bm = (BatteryManager) context.getSystemService(Context.BATTERY_SERVICE);
+        if (bm == null) return false;
+        int level = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY);
+        return level > 0 && level < LOW_BATTERY_THRESHOLD;
+    }
+
+    /**
+     * Notifies MeshManager that the app has entered or left the foreground.
+     *
+     * When the Activity resumes (foreground), BLE scanning switches to
+     * SCAN_MODE_LOW_LATENCY for faster peer discovery. When the Activity
+     * pauses (background), scanning drops to SCAN_MODE_LOW_POWER.
+     *
+     * The duty-cycle (scan 2s / pause 8s) runs in both modes, but the
+     * scan mode during the active window changes.
+     *
+     * @param foreground true when the Activity is visible, false when backgrounded
+     */
+    public void setAppInForeground(boolean foreground) {
+        boolean changed = (this.appInForeground != foreground);
+        this.appInForeground = foreground;
+
+        if (changed && bleAdvertiser != null) {
+            // Restart the duty-cycle immediately with the new scan mode
+            dutyCycleHandler.removeCallbacksAndMessages(null);
+            if (bleAdvertiser.isScanning()) {
+                bleAdvertiser.stopScanning();
+            }
+            startDutyCycleScanning();
+
+            Log.d(TAG, "App foreground state changed: " + foreground
+                    + " → BLE scan mode: "
+                    + (chooseScanMode() == ScanSettings.SCAN_MODE_LOW_LATENCY
+                    ? "LOW_LATENCY" : "LOW_POWER"));
+        }
     }
 
     /**
@@ -844,11 +972,13 @@ public class MeshManager {
         }
 
         // ── BLE scanning (dead-zone discovery) ──────────────────────────
-        // BLE scanning runs continuously, but we restart it here in case
-        // it was stopped or failed. BLE advertisements carry WiFi Direct
-        // MAC addresses, enabling connection even without any infrastructure.
+        // BLE scanning uses a duty-cycle pattern (scan 2s / pause 8s) to
+        // balance battery life against responsiveness. Restart the cycle
+        // here in case it was stopped or failed. The duty-cycle handler
+        // manages start/stop automatically.
         if (bleAdvertiser != null && !bleAdvertiser.isScanning()) {
-            bleAdvertiser.startScanning();
+            dutyCycleHandler.removeCallbacksAndMessages(null);
+            startDutyCycleScanning();
         }
 
         // ── WiFi Direct discovery ───────────────────────────────────────
@@ -1706,7 +1836,8 @@ public class MeshManager {
             wifiP2pManager.removeGroup(wifiP2pChannel, null);
         }
 
-        // BLE cleanup
+        // BLE cleanup — stop duty-cycle handler and scanner/advertiser
+        dutyCycleHandler.removeCallbacksAndMessages(null);
         if (bleAdvertiser != null) {
             bleAdvertiser.cleanup();
         }
