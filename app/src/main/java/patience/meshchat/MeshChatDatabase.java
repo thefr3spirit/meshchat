@@ -30,11 +30,14 @@ import androidx.room.RoomDatabase;
  *
  * ============================================================================
  */
-@Database(entities = {QueuedMessage.class}, version = 1, exportSchema = false)
+@Database(entities = {QueuedMessage.class, ChatMessageEntity.class}, version = 2, exportSchema = false)
 public abstract class MeshChatDatabase extends RoomDatabase {
 
     /** The single DAO for queued message operations */
     public abstract QueuedMessageDao queuedMessageDao();
+
+    /** DAO for chat messages — exposes Flow queries for Compose collectAsState() */
+    public abstract ChatMessageDao chatMessageDao();
 
     // ─── Singleton ──────────────────────────────────────────────────────
 

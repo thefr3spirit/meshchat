@@ -98,16 +98,11 @@
         </LinearLayout>
     </LinearLayout>
 
-    <!-- ═══ Messages Area ═══ -->
-    <androidx.recyclerview.widget.RecyclerView
-        android:id="@+id/recyclerMessages"
+    <!-- ═══ Messages Area (Compose) ═══ -->
+    <androidx.compose.ui.platform.ComposeView
+        android:id="@+id/composeMessageList"
         android:layout_width="0dp"
         android:layout_height="0dp"
-        android:paddingStart="4dp"
-        android:paddingEnd="4dp"
-        android:paddingTop="8dp"
-        android:paddingBottom="8dp"
-        android:clipToPadding="false"
         app:layout_constraintTop_toBottomOf="@id/header"
         app:layout_constraintBottom_toTopOf="@id/inputBar"
         app:layout_constraintStart_toStartOf="parent"
