@@ -106,16 +106,20 @@ public class BleAdvertiser {
     // ─── BLE Service UUID ───────────────────────────────────────────────
 
     /**
-     * Custom 128-bit service UUID that uniquely identifies MeshChat nodes.
-     * All MeshChat devices advertise and scan for this UUID.
-     * This is different from the RFCOMM UUID (MY_UUID in MeshManager) —
-     * this one is only used for BLE advertisement discovery.
+     * Discovery-only UUID: used exclusively by BleAdvertiser for non-connectable
+     * BLE beacons that carry the WiFi Direct MAC payload.
+     *
+     * IMPORTANT: this UUID is intentionally different from the GATT service UUID
+     * used by BleTransport.  Using the same UUID causes BleTransport's GATT
+     * scanner to receive non-connectable beacons (and fail to connect) and causes
+     * BleAdvertiser's scanner to receive GATT connectable ads (and trigger spurious
+     * WiFi Direct connections).  Keeping them separate eliminates cross-confusion.
      */
-    private static final UUID MESHCHAT_BLE_SERVICE_UUID =
+    private static final UUID MESHCHAT_BLE_DISCOVERY_UUID =
             UUID.fromString("d7e5f010-bead-4e9a-b9f5-0c6a8e3f1b2c");
 
     private static final ParcelUuid SERVICE_PARCEL_UUID =
-            new ParcelUuid(MESHCHAT_BLE_SERVICE_UUID);
+            new ParcelUuid(MESHCHAT_BLE_DISCOVERY_UUID);
 
     // ─── Manufacturer data ──────────────────────────────────────────────
 
@@ -445,6 +449,9 @@ public class BleAdvertiser {
         Long lastSeen = recentlyDiscovered.get(wifiDirectMac);
         if (lastSeen != null && (now - lastSeen) < DISCOVERY_DEDUP_MS) return;
         recentlyDiscovered.put(wifiDirectMac, now);
+
+        // Evict entries older than the dedup window to keep the map bounded.
+        recentlyDiscovered.entrySet().removeIf(e -> (now - e.getValue()) > DISCOVERY_DEDUP_MS);
 
         int rssi = result.getRssi();
         Log.d(TAG, "BLE discovered MeshChat peer: WiFi Direct MAC=" + wifiDirectMac

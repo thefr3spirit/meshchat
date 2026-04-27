@@ -1,8 +1,10 @@
 package patience.meshchat;
 
 import android.Manifest;
+import android.app.Dialog;
 import android.content.Context;
 import android.content.pm.PackageManager;
+import android.graphics.drawable.Drawable;
 import android.location.Location;
 import android.location.LocationListener;
 import android.location.LocationManager;
@@ -122,6 +124,19 @@ public class NetworkDiscoveryFragment extends Fragment {
     private NetworkAdapter networkAdapter;
     private final List<Network> networks = new ArrayList<>();
 
+    // ─── Connection progress dialog ─────────────────────────────────────
+
+    /** Non-null while a join/create attempt is in progress. */
+    private Dialog connectionProgressDialog;
+
+    // Stepper dot views inside the dialog
+    private View dotScan, dotDetect, dotConnect, dotHandshake, dotDone;
+    private View lineScanDetect, lineDetectConnect, lineConnectHandshake, lineHandshakeDone;
+    private TextView tvProgressTitle, tvProgressStatus;
+    private LinearLayout peerInfoRow;
+    private TextView tvPeerName, tvTransportBadge;
+    private View rssiBar1, rssiBar2, rssiBar3;
+
     // ─── Lifecycle ───────────────────────────────────────────────────────
 
     @Nullable
@@ -180,6 +195,12 @@ public class NetworkDiscoveryFragment extends Fragment {
         MeshService svc = getService();
         if (svc != null && svc.getMeshManager() != null) {
             svc.getMeshManager().setMessageListener(null);
+            svc.getMeshManager().setConnectionProgressListener(null);
+        }
+        // Dismiss dialog if fragment is paused mid-connection (e.g. screen rotation)
+        if (connectionProgressDialog != null && connectionProgressDialog.isShowing()) {
+            connectionProgressDialog.dismiss();
+            connectionProgressDialog = null;
         }
     }
 
@@ -390,15 +411,35 @@ public class NetworkDiscoveryFragment extends Fragment {
 
             @Override
             public void onNetworkJoined(String networkName) {
-                if (getActivity() != null) {
-                    getActivity().runOnUiThread(() ->
-                            ((MainActivity) requireActivity()).showMainApp());
-                }
+                // Do NOT navigate immediately — wait for the first CONNECTED event
+                // so the user sees the full stepper animation before the screen changes.
             }
 
             @Override
             public void onNetworkLeft() {}
         });
+
+        // Register the connection progress listener so the stepper updates live
+        svc.getMeshManager().setConnectionProgressListener(
+                (peerAddress, peerName, phase, transport, rssi) -> {
+                    if (getActivity() == null) return;
+                    getActivity().runOnUiThread(() -> {
+                        applyPhase(phase, peerName, transport, rssi);
+
+                        // Navigate to the main chat screen only after the first full handshake
+                        if (phase == ConnectionPhase.CONNECTED) {
+                            // Brief pause so the user sees the green "Connected" state
+                            if (getView() != null) {
+                                getView().postDelayed(() -> {
+                                    dismissConnectionProgress();
+                                    if (getActivity() != null) {
+                                        ((MainActivity) requireActivity()).showMainApp();
+                                    }
+                                }, 800);
+                            }
+                        }
+                    });
+                });
 
         // Populate any already-discovered networks immediately
         List<Network> existing = svc.getMeshManager().getDiscoveredNetworks();
@@ -415,7 +456,148 @@ public class NetworkDiscoveryFragment extends Fragment {
     private void onNetworkTapped(Network network) {
         MeshService svc = getService();
         if (svc == null || svc.getMeshManager() == null) return;
+        showConnectionProgress(network.name);
         svc.getMeshManager().joinNetwork(network.name);
+    }
+
+    // ─── Connection Progress Dialog ──────────────────────────────────────
+
+    /**
+     * Shows a non-dismissable dialog with a live 5-step connection stepper.
+     * Navigation to the main chat screen happens inside the MessageListener
+     * callback (onNetworkJoined) only after the first handshake succeeds.
+     */
+    private void showConnectionProgress(String networkName) {
+        if (getContext() == null) return;
+
+        // Inflate the custom dialog layout
+        View dialogView = LayoutInflater.from(requireContext())
+                .inflate(R.layout.dialog_connection_progress, null);
+
+        // Bind views
+        tvProgressTitle       = dialogView.findViewById(R.id.tvProgressTitle);
+        tvProgressStatus      = dialogView.findViewById(R.id.tvProgressStatus);
+        peerInfoRow           = dialogView.findViewById(R.id.peerInfoRow);
+        tvPeerName            = dialogView.findViewById(R.id.tvPeerName);
+        tvTransportBadge      = dialogView.findViewById(R.id.tvTransportBadge);
+        rssiBar1              = dialogView.findViewById(R.id.rssiBar1);
+        rssiBar2              = dialogView.findViewById(R.id.rssiBar2);
+        rssiBar3              = dialogView.findViewById(R.id.rssiBar3);
+        dotScan               = dialogView.findViewById(R.id.dotScan);
+        dotDetect             = dialogView.findViewById(R.id.dotDetect);
+        dotConnect            = dialogView.findViewById(R.id.dotConnect);
+        dotHandshake          = dialogView.findViewById(R.id.dotHandshake);
+        dotDone               = dialogView.findViewById(R.id.dotDone);
+        lineScanDetect        = dialogView.findViewById(R.id.lineScanDetect);
+        lineDetectConnect     = dialogView.findViewById(R.id.lineDetectConnect);
+        lineConnectHandshake  = dialogView.findViewById(R.id.lineConnectHandshake);
+        lineHandshakeDone     = dialogView.findViewById(R.id.lineHandshakeDone);
+
+        tvProgressTitle.setText("Joining \"" + networkName + "\"");
+
+        connectionProgressDialog = new MaterialAlertDialogBuilder(requireContext())
+                .setView(dialogView)
+                .setCancelable(false) // user must use Cancel button or wait for success
+                .setNegativeButton("Cancel", (d, w) -> {
+                    dismissConnectionProgress();
+                    MeshService svc = getService();
+                    if (svc != null && svc.getMeshManager() != null) {
+                        svc.getMeshManager().leaveNetwork();
+                    }
+                })
+                .create();
+        connectionProgressDialog.show();
+
+        // Immediately reflect SCANNING state
+        applyPhase(ConnectionPhase.SCANNING, "", "", 0);
+    }
+
+    private void dismissConnectionProgress() {
+        if (connectionProgressDialog != null) {
+            connectionProgressDialog.dismiss();
+            connectionProgressDialog = null;
+        }
+        // Detach the progress listener so we don't leak
+        MeshService svc = getService();
+        if (svc != null && svc.getMeshManager() != null) {
+            svc.getMeshManager().setConnectionProgressListener(null);
+        }
+    }
+
+    /**
+     * Updates the stepper to reflect the current {@link ConnectionPhase}.
+     * Must be called on the main thread (already ensured by MeshManager.fireProgress).
+     */
+    private void applyPhase(ConnectionPhase phase, String peerName,
+                             String transport, int rssi) {
+        if (connectionProgressDialog == null || !connectionProgressDialog.isShowing()) return;
+
+        Drawable active   = ContextCompat.getDrawable(requireContext(),
+                R.drawable.shape_step_dot_active);
+        Drawable inactive = ContextCompat.getDrawable(requireContext(),
+                R.drawable.shape_step_dot);
+        int activeLineColor = ContextCompat.getColor(requireContext(), R.color.colorPrimary);
+        int inactiveLineColor = ContextCompat.getColor(requireContext(), R.color.statusOffline);
+
+        // Activate dots up to and including the current phase
+        boolean pastScan      = phase.ordinal() >= ConnectionPhase.SCANNING.ordinal();
+        boolean pastDetect    = phase.ordinal() >= ConnectionPhase.PEER_DETECTED.ordinal();
+        boolean pastConnect   = phase.ordinal() >= ConnectionPhase.TRANSPORT_CONNECTING.ordinal();
+        boolean pastHandshake = phase.ordinal() >= ConnectionPhase.HANDSHAKING.ordinal();
+        boolean done          = phase == ConnectionPhase.CONNECTED;
+
+        dotScan.setBackground(pastScan ? active : inactive);
+        dotDetect.setBackground(pastDetect ? active : inactive);
+        dotConnect.setBackground(pastConnect ? active : inactive);
+        dotHandshake.setBackground(pastHandshake ? active : inactive);
+        dotDone.setBackground(done ? active : inactive);
+
+        lineScanDetect.setBackgroundColor(pastDetect ? activeLineColor : inactiveLineColor);
+        lineDetectConnect.setBackgroundColor(pastConnect ? activeLineColor : inactiveLineColor);
+        lineConnectHandshake.setBackgroundColor(pastHandshake ? activeLineColor : inactiveLineColor);
+        lineHandshakeDone.setBackgroundColor(done ? activeLineColor : inactiveLineColor);
+
+        // Show peer info row once we've detected a device
+        if (pastDetect && !peerName.isEmpty()) {
+            peerInfoRow.setVisibility(View.VISIBLE);
+            tvPeerName.setText(peerName);
+            String badge = "wifi_direct".equals(transport) ? "WiFi Direct"
+                    : "ble".equals(transport) ? "BLE" : "Bluetooth";
+            tvTransportBadge.setText(badge);
+            // RSSI bars: 3 bars for strong (> -60), 2 for medium (> -75), 1 for weak
+            int bars = rssi == 0 ? 0 : (rssi > -60 ? 3 : rssi > -75 ? 2 : 1);
+            int barOn  = ContextCompat.getColor(requireContext(), R.color.colorPrimary);
+            int barOff = ContextCompat.getColor(requireContext(), R.color.statusOffline);
+            rssiBar1.setBackgroundColor(bars >= 1 ? barOn : barOff);
+            rssiBar2.setBackgroundColor(bars >= 2 ? barOn : barOff);
+            rssiBar3.setBackgroundColor(bars >= 3 ? barOn : barOff);
+        }
+
+        // Status message for each phase
+        switch (phase) {
+            case SCANNING:
+                tvProgressStatus.setText("Scanning for nearby MeshChat devices…");
+                break;
+            case PEER_DETECTED:
+                tvProgressStatus.setText("Found \"" + peerName + "\" nearby");
+                break;
+            case TRANSPORT_CONNECTING:
+                tvProgressStatus.setText("Establishing radio link with \"" + peerName + "\"...");
+                break;
+            case HANDSHAKING:
+                tvProgressStatus.setText("Exchanging identity with \"" + peerName + "\"...");
+                break;
+            case CONNECTED:
+                tvProgressStatus.setText("Secured — joining the mesh!");
+                break;
+            case FAILED:
+                tvProgressStatus.setText("Connection attempt failed. Still scanning…");
+                // Reset dots back to SCANNING level so user sees ongoing attempts
+                applyPhase(ConnectionPhase.SCANNING, "", "", 0);
+                return;
+            default:
+                break;
+        }
     }
 
     private void showCreateNetworkDialog() {
@@ -444,6 +626,7 @@ public class NetworkDiscoveryFragment extends Fragment {
                     }
                     MeshService svc = getService();
                     if (svc != null && svc.getMeshManager() != null) {
+                        showConnectionProgress(name);
                         svc.getMeshManager().createNetwork(name);
                     }
                 })

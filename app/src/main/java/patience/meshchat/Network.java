@@ -18,10 +18,14 @@ public class Network {
     /** Timestamp when this network was first discovered (ms since epoch) */
     public long discoveredAt;
 
+    /** Timestamp of the most recent advertisement seen from this network */
+    public long lastSeenMs;
+
     public Network(String name) {
         this.name = name;
         this.nodeCount = 1;
         this.discoveredAt = System.currentTimeMillis();
+        this.lastSeenMs = this.discoveredAt;
     }
 
     /** Friendly description of how many devices are visible */

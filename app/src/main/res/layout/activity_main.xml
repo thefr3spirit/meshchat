@@ -25,6 +25,27 @@
         android:visibility="gone" />
 
     <!--
+        Persistent mesh connection chip.
+        Visible only when the user is inside a network (BottomNav visible).
+        Shows live peer count and connection state; tap for peer detail.
+    -->
+    <TextView
+        android:id="@+id/meshStatusChip"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:paddingTop="5dp"
+        android:paddingBottom="5dp"
+        android:paddingStart="16dp"
+        android:paddingEnd="16dp"
+        android:gravity="center"
+        android:textColor="#FFFFFF"
+        android:textSize="12sp"
+        android:background="@color/colorPrimaryDark"
+        android:visibility="gone"
+        android:clickable="true"
+        android:focusable="true" />
+
+    <!--
         Fragment container — fills all remaining space.
         When BottomNavigationView is GONE (discovery / chat screen),
         this child with weight=1 automatically expands to fill full height.

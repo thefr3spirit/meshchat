@@ -30,13 +30,18 @@ import patience.meshchat.gossip.GossipManager;
 import patience.meshchat.transport.CompositeTransport;
 import patience.meshchat.transport.MeshTransport;
 
+import com.google.gson.Gson;
+
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
 import java.io.IOException;
-import java.io.ObjectInputStream;
-import java.io.ObjectOutputStream;
+import java.io.InputStreamReader;
+import java.io.OutputStreamWriter;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
@@ -257,8 +262,8 @@ public class MeshManager {
     /** WiFi Direct enabled flag (updated by P2P state broadcasts) */
     private volatile boolean wifiP2pEnabled = false;
 
-    /** Output streams for WiFi Direct peers (keyed by IP address string) */
-    private final Map<String, ObjectOutputStream> wifiDirectOutputStreams =
+    /** JSON writers for WiFi Direct peers (keyed by IP address string) */
+    private final Map<String, BufferedWriter> wifiDirectOutputStreams =
             new ConcurrentHashMap<>();
 
     /** Active WiFi Direct TCP sockets (keyed by IP address string) */
@@ -283,8 +288,8 @@ public class MeshManager {
      */
     private final Set<String> connectingNodes = ConcurrentHashMap.newKeySet();
 
-    /** Output streams keyed by peer's BT MAC address */
-    private final Map<String, ObjectOutputStream> bluetoothOutputStreams =
+    /** JSON writers keyed by peer's BT MAC address */
+    private final Map<String, BufferedWriter> bluetoothOutputStreams =
             new ConcurrentHashMap<>();
 
     /** Active Bluetooth sockets keyed by BT MAC address */
@@ -341,11 +346,20 @@ public class MeshManager {
 
     private volatile boolean visible = true;
 
+    // ─── Serialization ──────────────────────────────────────────────────
+
+    /** Gson instance for JSON wire format (replaces Java object serialization) */
+    private final Gson gson = new Gson();
+
     // ─── Callbacks & threading ──────────────────────────────────────────
 
     private MessageListener messageListener;
+    private ConnectionProgressListener connectionProgressListener;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private ScheduledExecutorService discoveryScheduler;
+
+    /** Holds the pending postDelayed onNetworkDiscovered runnable so it can be cancelled. */
+    private Runnable discoveryNotifyRunnable;
 
     // ─── Heartbeat & liveness tracking ──────────────────────────────────
 
@@ -361,6 +375,24 @@ public class MeshManager {
     // ═══════════════════════════════════════════════════════════════════
     // CALLBACK INTERFACE
     // ═══════════════════════════════════════════════════════════════════
+
+    /**
+     * Delivers live updates on the connection establishment process so the UI
+     * can show a step-by-step progress indicator (Scanning → Detected →
+     * Connecting → Handshaking → Connected / Failed).
+     */
+    public interface ConnectionProgressListener {
+        /**
+         * @param peerAddress  BT MAC or WiFi Direct IP of the peer (may be empty
+         *                     during SCANNING before any peer is found)
+         * @param peerName     Human-readable peer name (from BT device name or handshake)
+         * @param phase        The current connection phase
+         * @param transport    Transport in use: "bluetooth", "wifi_direct", or "ble"
+         * @param rssi         Signal strength in dBm (0 if unknown)
+         */
+        void onProgressChanged(String peerAddress, String peerName,
+                               ConnectionPhase phase, String transport, int rssi);
+    }
 
     public interface MessageListener {
         /** A user chat message arrived (broadcast or private addressed to us) */
@@ -479,17 +511,15 @@ public class MeshManager {
                     Log.d(TAG, "Transport data from " + peerId
                             + " via " + transportName
                             + " (" + data.length + " bytes)");
-                    // Deserialise and route through existing message pipeline
+                    // Deserialise JSON and route through the existing message pipeline
                     try {
-                        java.io.ObjectInputStream ois =
-                                new java.io.ObjectInputStream(
-                                        new java.io.ByteArrayInputStream(data));
-                        Object obj = ois.readObject();
-                        if (obj instanceof Message) {
-                            handleIncomingMessage((Message) obj, peerId);
+                        String json = new String(data, StandardCharsets.UTF_8);
+                        Message msg = gson.fromJson(json, Message.class);
+                        if (msg != null) {
+                            handleIncomingMessage(msg, peerId);
                         }
                     } catch (Exception e) {
-                        Log.w(TAG, "Transport deser failed: " + e.getMessage());
+                        Log.w(TAG, "Transport JSON parse failed: " + e.getMessage());
                     }
                 }
 
@@ -731,8 +761,37 @@ public class MeshManager {
             wifiP2pChannel = wifiP2pManager.initialize(
                     context, Looper.getMainLooper(), null);
             Log.d(TAG, "WiFi Direct initialised");
+            // On Android 14+, WIFI_P2P_THIS_DEVICE_CHANGED_ACTION is not delivered.
+            // Use requestDeviceInfo() proactively to learn our own WiFi Direct MAC.
+            fetchOwnWifiDirectInfo();
         } else {
             Log.w(TAG, "WiFi Direct not supported on this device");
+        }
+    }
+
+    /**
+     * Requests this device's own WiFi Direct info (MAC address) via the
+     * non-deprecated API. Falls back gracefully if permissions are missing.
+     * Called at init time and whenever WiFi P2P is re-enabled.
+     */
+    private void fetchOwnWifiDirectInfo() {
+        if (wifiP2pManager == null || wifiP2pChannel == null) return;
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                wifiP2pManager.requestDeviceInfo(wifiP2pChannel, device -> {
+                    if (device == null) return;
+                    String wdMac = device.deviceAddress;
+                    if (wdMac != null && !wdMac.isEmpty()) {
+                        myWifiDirectMac = wdMac;
+                        if (bleAdvertiser != null) {
+                            bleAdvertiser.startAdvertising(wdMac, myNodeId);
+                        }
+                        Log.d(TAG, "WiFi Direct MAC (requestDeviceInfo): " + wdMac);
+                    }
+                });
+            }
+        } catch (SecurityException e) {
+            Log.w(TAG, "requestDeviceInfo permission denied: " + e.getMessage());
         }
     }
 
@@ -741,7 +800,12 @@ public class MeshManager {
     private void registerReceivers() {
         IntentFilter btFilter = new IntentFilter();
         btFilter.addAction(BluetoothDevice.ACTION_FOUND);
-        context.registerReceiver(bluetoothReceiver, btFilter);
+        // Android 14+ requires explicit RECEIVER_NOT_EXPORTED for dynamic receivers.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            context.registerReceiver(bluetoothReceiver, btFilter, Context.RECEIVER_NOT_EXPORTED);
+        } else {
+            context.registerReceiver(bluetoothReceiver, btFilter);
+        }
 
         // WiFi Direct events
         if (wifiP2pManager != null) {
@@ -750,7 +814,12 @@ public class MeshManager {
             wdFilter.addAction(WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION);
             wdFilter.addAction(WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION);
             wdFilter.addAction(WifiP2pManager.WIFI_P2P_THIS_DEVICE_CHANGED_ACTION);
-            context.registerReceiver(wifiDirectReceiver, wdFilter);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                context.registerReceiver(wifiDirectReceiver, wdFilter,
+                        Context.RECEIVER_NOT_EXPORTED);
+            } else {
+                context.registerReceiver(wifiDirectReceiver, wdFilter);
+            }
         }
     }
 
@@ -774,16 +843,20 @@ public class MeshManager {
                 String address = device.getAddress();
                 if (name == null || !name.startsWith(BT_PREFIX)) return;
 
+                // Guard: BT name exactly "MC_" yields empty network name
                 String networkName = name.substring(BT_PREFIX.length());
+                if (networkName.isEmpty()) return;
+
                 int rssi = intent.getShortExtra(BluetoothDevice.EXTRA_RSSI, Short.MIN_VALUE);
                 rssiValues.put(address, rssi);
 
-                // Update discovered networks list
+                // Update discovered networks list — refresh lastSeenMs on each sighting
                 Network net = discoveredNetworks.get(networkName);
                 if (net == null) {
                     discoveredNetworks.put(networkName, new Network(networkName));
                 } else {
                     net.nodeCount++;
+                    net.lastSeenMs = System.currentTimeMillis();
                 }
                 notifyNetworksUpdated();
 
@@ -792,15 +865,21 @@ public class MeshManager {
                 discoveredPeers.put(address, new PeerAdapter.PeerInfo(
                         name, address, alreadyConnected, "bluetooth", rssi));
 
-                // Auto-connect if we're in the same network, signal is strong enough,
-                // and we're not already connected or in the middle of connecting.
-                boolean alreadyConnecting = connectingNodes.contains(address);
+                // Auto-connect: same network (case-insensitive), strong enough signal,
+                // not already connected. connectingNodes.add() is atomic — returns false
+                // if another thread already claimed this address, eliminating the race.
                 if (currentNetworkName != null
-                        && networkName.equals(currentNetworkName)
+                        && networkName.equalsIgnoreCase(currentNetworkName)
                         && !alreadyConnected
-                        && !alreadyConnecting
                         && rssi >= rssiThreshold) {
-                    new BluetoothClientThread(device).start();
+
+                    // Notify UI: we found a peer before the socket even opens
+                    fireProgress(address, name, ConnectionPhase.PEER_DETECTED,
+                            "bluetooth", rssi);
+
+                    if (connectingNodes.add(address)) {
+                        new BluetoothClientThread(device).start();
+                    }
                 }
             } catch (SecurityException e) {
                 Log.w(TAG, "BT receiver permission error: " + e.getMessage());
@@ -846,6 +925,8 @@ public class MeshManager {
                     wifiP2pEnabled =
                             (state == WifiP2pManager.WIFI_P2P_STATE_ENABLED);
                     Log.d(TAG, "WiFi P2P enabled: " + wifiP2pEnabled);
+                    // Re-fetch our own WiFi Direct MAC whenever P2P toggles back on.
+                    if (wifiP2pEnabled) fetchOwnWifiDirectInfo();
                     break;
                 }
 
@@ -1000,47 +1081,111 @@ public class MeshManager {
 
     /**
      * Joins an existing mesh network by name.
-     * Updates our BT device name to "MC_<name>" so peers can discover us.
+     *
+     * Steps:
+     *  1. Sanitize the name (strip pipe chars that break handshake parsing,
+     *     truncate to the max length that fits in a BT device name).
+     *  2. Disconnect all peers from any previously joined network.
+     *  3. Derive a per-network AES key so each network's messages are isolated.
+     *  4. Update the BT device name so peers can discover us.
+     *  5. Kick off a new discovery scan.
      */
     public void joinNetwork(String networkName) {
-        this.currentNetworkName = networkName;
-        prefs.edit().putString(KEY_NETWORK_NAME, networkName).apply();
+        // ── 1. Sanitize ────────────────────────────────────────────────
+        // Strip pipe chars (handshake delimiter) and control characters
+        String cleaned = networkName.replace("|", "").trim();
+        if (cleaned.isEmpty()) {
+            Log.w(TAG, "joinNetwork: sanitized name is empty, aborting");
+            return;
+        }
+        // Truncate so "MC_" + name fits within BT_NAME_MAX (30 chars)
+        int maxLen = BT_NAME_MAX - BT_PREFIX.length();
+        if (cleaned.length() > maxLen) cleaned = cleaned.substring(0, maxLen);
+
+        // ── 2. Disconnect all peers from the previous network ──────────
+        if (currentNetworkName != null && !currentNetworkName.equals(cleaned)) {
+            List<String> btPeers = new ArrayList<>(connectedNodes);
+            for (String mac : btPeers) notifyNodeDisconnected(mac);
+            List<String> wdPeers = new ArrayList<>(wifiDirectConnectedNodes);
+            for (String ip : wdPeers) notifyNodeDisconnected(ip);
+        }
+
+        // ── 3. Per-network AES key ─────────────────────────────────────
+        // Each network gets its own key derived from the network name so that
+        // devices on different networks cannot decrypt each other's broadcasts.
+        cryptoManager.updatePassphrase(cleaned);
+
+        this.currentNetworkName = cleaned;
+        prefs.edit().putString(KEY_NETWORK_NAME, cleaned).apply();
+
+        // ── 4. Update BT name + start discovery ───────────────────────
         updateBtName();
         startDiscovery();
+
+        final String joinedName = cleaned;
         if (messageListener != null) {
-            mainHandler.post(() -> messageListener.onNetworkJoined(networkName));
+            mainHandler.post(() -> messageListener.onNetworkJoined(joinedName));
         }
-        Log.d(TAG, "Joined network: " + networkName);
+        Log.d(TAG, "Joined network: " + joinedName);
     }
 
     /**
      * Creates a new mesh network with the given name and joins it immediately.
      */
     public void createNetwork(String networkName) {
-        joinNetwork(networkName); // creating and joining are the same operation
+        joinNetwork(networkName);
     }
 
     /**
-     * Leaves the current network. Disconnects all peers and resets BT name.
+     * Leaves the current network. Stops all radios, disconnects all peers,
+     * and resets BT name. Safe to call multiple times.
      */
     public void leaveNetwork() {
         this.currentNetworkName = null;
         prefs.edit().remove(KEY_NETWORK_NAME).apply();
 
-        // Disconnect all peers
-        List<String> snapshot = new ArrayList<>(connectedNodes);
-        for (String mac : snapshot) {
-            notifyNodeDisconnected(mac);
+        // ── 1. Stop the duty-cycle BLE scan loop immediately ────────────
+        dutyCycleHandler.removeCallbacksAndMessages(null);
+
+        // ── 2. Stop BLE advertising and scanning ─────────────────────────
+        if (bleAdvertiser != null) {
+            bleAdvertiser.stopAdvertising();
+            bleAdvertiser.stopScanning();
         }
 
-        // Remove WiFi Direct group if we formed one
+        // ── 3. Cancel any in-progress BT Classic scan ────────────────────
+        try {
+            if (bluetoothAdapter != null && bluetoothAdapter.isDiscovering()) {
+                bluetoothAdapter.cancelDiscovery();
+            }
+        } catch (SecurityException ignored) {}
+
+        // ── 4. Disconnect all currently connected peers ───────────────────
+        List<String> btSnapshot = new ArrayList<>(connectedNodes);
+        for (String mac : btSnapshot) notifyNodeDisconnected(mac);
+        List<String> wdSnapshot = new ArrayList<>(wifiDirectConnectedNodes);
+        for (String ip : wdSnapshot) notifyNodeDisconnected(ip);
+
+        // ── 5. Remove WiFi Direct group with proper listener ─────────────
         if (wifiP2pManager != null && wifiP2pChannel != null) {
-            wifiP2pManager.removeGroup(wifiP2pChannel, null);
+            try {
+                wifiP2pManager.removeGroup(wifiP2pChannel,
+                        new WifiP2pManager.ActionListener() {
+                            @Override public void onSuccess() {
+                                Log.d(TAG, "WiFi Direct group removed");
+                            }
+                            @Override public void onFailure(int reason) {
+                                Log.w(TAG, "WiFi Direct group remove failed: " + reason);
+                            }
+                        });
+            } catch (SecurityException e) {
+                Log.w(TAG, "removeGroup permission denied: " + e.getMessage());
+            }
         }
         isGroupOwner = false;
         groupOwnerAddress = null;
 
-        // Reset BT name
+        // ── 6. Reset BT device name to generic ───────────────────────────
         try {
             if (bluetoothAdapter != null
                     && (Build.VERSION.SDK_INT < Build.VERSION_CODES.S
@@ -1051,7 +1196,10 @@ public class MeshManager {
             Log.w(TAG, "BT name reset failed: " + e.getMessage());
         }
 
+        // ── 7. Flush stale discovery state ───────────────────────────────
         discoveredPeers.clear();
+        discoveredNetworks.clear();
+
         if (messageListener != null) {
             mainHandler.post(() -> messageListener.onNetworkLeft());
         }
@@ -1091,7 +1239,18 @@ public class MeshManager {
      * connections automatically.
      */
     public void startDiscovery() {
-        discoveredPeers.clear();
+        // Only clear the peer cache if BT isn't actively scanning.
+        // Clearing mid-scan races with incoming ACTION_FOUND callbacks.
+        try {
+            if (bluetoothAdapter == null || !bluetoothAdapter.isDiscovering()) {
+                discoveredPeers.clear();
+            }
+        } catch (SecurityException ignored) {
+            discoveredPeers.clear();
+        }
+
+        // Fire SCANNING progress so the UI can show feedback immediately
+        fireProgress("", "", ConnectionPhase.SCANNING, "", 0);
 
         // ── Bluetooth Classic discovery ─────────────────────────────────
         try {
@@ -1103,27 +1262,25 @@ public class MeshManager {
         }
 
         // ── BLE scanning (dead-zone discovery) ──────────────────────────
-        // BLE scanning uses a duty-cycle pattern (scan 2s / pause 8s) to
-        // balance battery life against responsiveness. Restart the cycle
-        // here in case it was stopped or failed. The duty-cycle handler
-        // manages start/stop automatically.
         if (bleAdvertiser != null && !bleAdvertiser.isScanning()) {
             dutyCycleHandler.removeCallbacksAndMessages(null);
             startDutyCycleScanning();
         }
 
         // ── WiFi Direct discovery ───────────────────────────────────────
-        // Uses WifiP2pManager.discoverPeers() to find nearby WiFi Direct
-        // devices. Results arrive asynchronously via the
-        // WIFI_P2P_PEERS_CHANGED_ACTION broadcast, which triggers
-        // requestPeers() → onWifiDirectPeersAvailable().
         startWifiDirectDiscovery();
-        // Notify UI of scan completion after ~12s (standard BT discovery duration)
-        mainHandler.postDelayed(() -> {
+
+        // Cancel any previous pending notify to avoid stacking up delayed callbacks
+        if (discoveryNotifyRunnable != null) {
+            mainHandler.removeCallbacks(discoveryNotifyRunnable);
+        }
+        discoveryNotifyRunnable = () -> {
             if (messageListener != null) {
                 messageListener.onNetworkDiscovered(getDiscoveredNetworks());
             }
-        }, 12_000);
+            discoveryNotifyRunnable = null;
+        };
+        mainHandler.postDelayed(discoveryNotifyRunnable, 12_000);
     }
 
     private void startPeriodicDiscovery() {
@@ -1225,9 +1382,14 @@ public class MeshManager {
         lastSeenTimestamps.put(address, System.currentTimeMillis());
     }
 
-    /** Returns the current list of discovered mesh networks */
+    /** Returns discovered mesh networks seen within the last 60 seconds. */
     public List<Network> getDiscoveredNetworks() {
-        return new ArrayList<>(discoveredNetworks.values());
+        long cutoff = System.currentTimeMillis() - 60_000;
+        List<Network> live = new ArrayList<>();
+        for (Network n : discoveredNetworks.values()) {
+            if (n.lastSeenMs >= cutoff) live.add(n);
+        }
+        return live;
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -1420,7 +1582,7 @@ public class MeshManager {
      */
     private void sendToAllPeers(Message message, String excludeAddress) {
         // Bluetooth transport
-        for (Map.Entry<String, ObjectOutputStream> entry : bluetoothOutputStreams.entrySet()) {
+        for (Map.Entry<String, BufferedWriter> entry : bluetoothOutputStreams.entrySet()) {
             String mac = entry.getKey();
             if (mac.equals(excludeAddress)) continue;
             if (!writeToStream(entry.getValue(), message, mac)) {
@@ -1428,7 +1590,7 @@ public class MeshManager {
             }
         }
         // WiFi Direct transport
-        for (Map.Entry<String, ObjectOutputStream> entry : wifiDirectOutputStreams.entrySet()) {
+        for (Map.Entry<String, BufferedWriter> entry : wifiDirectOutputStreams.entrySet()) {
             String addr = entry.getKey();
             if (addr.equals(excludeAddress)) continue;
             if (!writeToStream(entry.getValue(), message, addr)) {
@@ -1439,7 +1601,7 @@ public class MeshManager {
 
     /** Sends a message to a single specific peer (checks BT, then WiFi Direct) */
     private void sendToNode(String mac, Message message) {
-        ObjectOutputStream out = bluetoothOutputStreams.get(mac);
+        BufferedWriter out = bluetoothOutputStreams.get(mac);
         if (out == null) out = wifiDirectOutputStreams.get(mac);
         if (out != null) {
             if (!writeToStream(out, message, mac)) {
@@ -1453,16 +1615,18 @@ public class MeshManager {
     }
 
     /**
-     * Writes a message to an output stream.
+     * Serialises {@code message} to JSON and writes it as a single line to
+     * the peer's {@link BufferedWriter}.  One JSON object per line is the
+     * framing contract; the receiver reads line-by-line.
      *
      * @return true if the write succeeded, false if it failed
      */
-    private boolean writeToStream(ObjectOutputStream out, Message message, String nodeId) {
+    private boolean writeToStream(BufferedWriter out, Message message, String nodeId) {
         try {
             synchronized (out) {
-                out.writeObject(message);
+                out.write(gson.toJson(message));
+                out.newLine();
                 out.flush();
-                out.reset();
             }
             return true;
         } catch (IOException e) {
@@ -1491,7 +1655,7 @@ public class MeshManager {
      * @return true if delivery succeeded
      */
     private boolean deliverStoredMessage(Message message, String address) {
-        ObjectOutputStream out = bluetoothOutputStreams.get(address);
+        BufferedWriter out = bluetoothOutputStreams.get(address);
         if (out == null) out = wifiDirectOutputStreams.get(address);
         if (out == null) return false;
         return writeToStream(out, message, address);
@@ -1598,44 +1762,60 @@ public class MeshManager {
     // ─── Handshake ──────────────────────────────────────────────────────
 
     /**
-     * Sends our identity to a newly connected peer.
-     * Must be called immediately after the ObjectOutputStream is ready.
+     * Sends our identity to a newly connected peer via a JSON line.
      *
-     * Handshake content format: "username|nodeUUID|fcmToken|e2ePublicKey"
-     * The E2E public key (X25519, Base64-encoded) is included so that the
-     * peer can encrypt private messages for us using ECIES, even if we
-     * are multiple hops apart later.
+     * Handshake content format (pipe-delimited, 5 fields):
+     *   "username|nodeUUID|fcmToken|e2ePublicKey|networkName"
+     *
+     * Field 5 (networkName) lets the receiver reject mismatched network peers.
+     * Legacy peers (< 5 fields) are accepted but will not have network filtering.
      */
-    private void sendHandshake(ObjectOutputStream out) {
+    private void sendHandshake(BufferedWriter out) {
         String fcmToken = FcmTokenManager.getOwnToken(context);
         Message handshake = Message.createHandshake(username, myNodeId, fcmToken);
-        // Append E2E public key to handshake content
         String e2ePubKey = e2eCryptoManager.getPublicKeyBase64();
-        handshake.setContent(handshake.getContent() + "|" + e2ePubKey);
+        // Sanitize username so it cannot contain the pipe delimiter
+        String safeUsername = username.replace("|", "");
+        String networkField = currentNetworkName != null ? currentNetworkName : "";
+        handshake.setContent(safeUsername + "|" + myNodeId + "|"
+                + (fcmToken != null ? fcmToken : "") + "|"
+                + e2ePubKey + "|" + networkField);
         try {
             synchronized (out) {
-                out.writeObject(handshake);
+                out.write(gson.toJson(handshake));
+                out.newLine();
                 out.flush();
-                out.reset();
             }
         } catch (IOException e) {
             Log.w(TAG, "Handshake send failed: " + e.getMessage());
         }
     }
 
-    /** Processes an incoming handshake, mapping the peer's UUID to their BT MAC */
+    /** Processes an incoming handshake, mapping the peer's UUID to their BT MAC. */
     private void handleHandshake(Message message, String sourceMac) {
         String content = message.getContent();
-        // Format: "username|nodeUUID|fcmToken|e2ePublicKey" (4 fields)
-        //   or:   "username|nodeUUID|fcmToken" (legacy, 3 fields)
-        //   or:   "username|nodeUUID" (legacy, 2 fields)
-        String[] parts = content.split("\\|", 4);
+        // Format: "username|nodeUUID|fcmToken|e2ePublicKey|networkName" (5 fields)
+        //   or:   "username|nodeUUID|fcmToken|e2ePublicKey" (legacy 4 fields)
+        //   or:   "username|nodeUUID|fcmToken" (legacy 3 fields)
+        //   or:   "username|nodeUUID" (legacy 2 fields)
+        String[] parts = content.split("\\|", 5);
         if (parts.length < 2) return;
 
-        String peerUsername = parts[0];
-        String peerNodeId   = parts[1];
-        String peerFcmToken = (parts.length >= 3 && !parts[2].isEmpty()) ? parts[2] : null;
+        String peerUsername  = parts[0];
+        String peerNodeId    = parts[1];
+        String peerFcmToken  = (parts.length >= 3 && !parts[2].isEmpty()) ? parts[2] : null;
         String peerE2ePubKey = (parts.length >= 4 && !parts[3].isEmpty()) ? parts[3] : null;
+        String peerNetwork   = (parts.length >= 5 && !parts[4].isEmpty()) ? parts[4] : null;
+
+        // Network membership check: if both sides declare a network and they differ,
+        // reject the connection to prevent cross-network leakage.
+        if (currentNetworkName != null && peerNetwork != null
+                && !peerNetwork.equalsIgnoreCase(currentNetworkName)) {
+            Log.w(TAG, "Rejecting peer " + peerUsername
+                    + " from different network: " + peerNetwork);
+            notifyNodeDisconnected(sourceMac);
+            return;
+        }
 
         // Store bidirectional UUID ↔ MAC mapping
         nodeIdToAddress.put(peerNodeId, sourceMac);
@@ -1654,6 +1834,11 @@ public class MeshManager {
 
         Log.d(TAG, "Handshake from " + peerUsername + " (" + peerNodeId + ") @ " + sourceMac);
         notifyNodeInfoUpdated();
+
+        // Fire CONNECTED progress event — the peer is now fully identified
+        int rssi = rssiValues.getOrDefault(sourceMac, 0);
+        String transport = wifiDirectConnectedNodes.contains(sourceMac) ? "wifi_direct" : "bluetooth";
+        fireProgress(sourceMac, peerUsername, ConnectionPhase.CONNECTED, transport, rssi);
 
         // Notify all OTHER connected peers that a new node joined
         new FcmNotificationSender(context).notifyPeersOfNewNode(peerUsername, peerNodeId);
@@ -1677,14 +1862,41 @@ public class MeshManager {
 
     private void sendAck(String originalMsgId, String originalSenderId, String sourceMac) {
         Message ack = Message.createAck(originalMsgId, myNodeId, originalSenderId);
-        sendToNode(sourceMac, ack); // ACK goes directly back to sender
+        // Set recipientId so relay nodes can route the ACK toward the original sender.
+        ack.setRecipientId(originalSenderId);
+
+        // Try a direct hop first; if the sender isn't directly connected, flood
+        // the ACK so the mesh can relay it back along any available path.
+        String senderMac = nodeIdToAddress.get(originalSenderId);
+        if (senderMac != null && (connectedNodes.contains(senderMac)
+                || wifiDirectConnectedNodes.contains(senderMac))) {
+            sendToNode(senderMac, ack);
+        } else {
+            sendToAllPeers(ack, sourceMac); // flood — relay nodes will forward
+        }
     }
 
     private void handleAck(Message ack) {
         String originalMsgId = ack.getContent();
-        if (messageListener != null) {
-            mainHandler.post(() -> messageListener.onDeliveryStatusChanged(originalMsgId));
+        String recipientId = ack.getRecipientId();
+
+        // If this ACK is addressed to us, deliver it to the UI
+        if (recipientId == null || recipientId.equals(myNodeId)) {
+            if (messageListener != null) {
+                mainHandler.post(() -> messageListener.onDeliveryStatusChanged(originalMsgId));
+            }
+            return;
         }
+
+        // Otherwise relay it toward the intended recipient (multi-hop ACK forwarding)
+        if (!ack.canForward()) return;
+        ack.incrementHopCount();
+        String recipientMac = nodeIdToAddress.get(recipientId);
+        if (recipientMac != null && (connectedNodes.contains(recipientMac)
+                || wifiDirectConnectedNodes.contains(recipientMac))) {
+            sendToNode(recipientMac, ack);
+        }
+        // If no direct path, the ACK is dropped — best-effort only for relay ACKs
     }
 
     // ─── Heartbeat ──────────────────────────────────────────────────────
@@ -1827,14 +2039,14 @@ public class MeshManager {
         lastSeenTimestamps.remove(mac); // clean up liveness tracking
 
         // Bluetooth cleanup
-        ObjectOutputStream out = bluetoothOutputStreams.remove(mac);
+        BufferedWriter out = bluetoothOutputStreams.remove(mac);
         if (out != null) { try { out.close(); } catch (IOException ignored) {} }
 
         BluetoothSocket sock = bluetoothSockets.remove(mac);
         if (sock != null) { try { sock.close(); } catch (IOException ignored) {} }
 
         // WiFi Direct cleanup (address may be an IP string)
-        ObjectOutputStream wdOut = wifiDirectOutputStreams.remove(mac);
+        BufferedWriter wdOut = wifiDirectOutputStreams.remove(mac);
         if (wdOut != null) { try { wdOut.close(); } catch (IOException ignored) {} }
 
         Socket wdSock = wifiDirectSockets.remove(mac);
@@ -1854,6 +2066,30 @@ public class MeshManager {
 
     public void setMessageListener(MessageListener listener) {
         this.messageListener = listener;
+        // Cancel any pending discovery notification if the listener is detached
+        if (listener == null && discoveryNotifyRunnable != null) {
+            mainHandler.removeCallbacks(discoveryNotifyRunnable);
+            discoveryNotifyRunnable = null;
+        }
+    }
+
+    public void setConnectionProgressListener(ConnectionProgressListener listener) {
+        this.connectionProgressListener = listener;
+    }
+
+    /**
+     * Dispatches a connection progress event on the main thread.
+     * Safe to call from any thread.
+     */
+    private void fireProgress(String peerAddress, String peerName,
+                               ConnectionPhase phase, String transport, int rssi) {
+        if (connectionProgressListener == null) return;
+        mainHandler.post(() -> {
+            if (connectionProgressListener != null) {
+                connectionProgressListener.onProgressChanged(
+                        peerAddress, peerName, phase, transport, rssi);
+            }
+        });
     }
 
     public StoreAndForwardManager getStoreAndForwardManager() {
@@ -1960,7 +2196,7 @@ public class MeshManager {
         try { context.unregisterReceiver(wifiDirectReceiver); } catch (Exception ignored) {}
         if (bluetoothServerThread != null) bluetoothServerThread.interrupt();
 
-        for (ObjectOutputStream out : bluetoothOutputStreams.values()) {
+        for (BufferedWriter out : bluetoothOutputStreams.values()) {
             try { out.close(); } catch (IOException ignored) {}
         }
         for (BluetoothSocket s : bluetoothSockets.values()) {
@@ -1969,7 +2205,7 @@ public class MeshManager {
 
         // WiFi Direct cleanup
         if (wifiDirectServerThread != null) wifiDirectServerThread.interrupt();
-        for (ObjectOutputStream out : wifiDirectOutputStreams.values()) {
+        for (BufferedWriter out : wifiDirectOutputStreams.values()) {
             try { out.close(); } catch (IOException ignored) {}
         }
         for (Socket s : wifiDirectSockets.values()) {
@@ -2109,12 +2345,13 @@ public class MeshManager {
     }
 
     /**
-     * Manages bidirectional messaging on an established Bluetooth connection.
+     * Manages bidirectional messaging on an established Bluetooth RFCOMM connection.
      *
-     * DEADLOCK PREVENTION: ObjectOutputStream MUST be created and flushed
-     * before ObjectInputStream. Both sides do this — they write their stream
-     * header first, then read the remote header. This prevents both sides
-     * from blocking forever waiting for the other's header.
+     * Wire format: UTF-8 JSON, one Message object per line.
+     * This replaces Java object serialisation and eliminates the deserialization
+     * RCE attack surface while also being human-readable for debugging.
+     *
+     * Progress events emitted: TRANSPORT_CONNECTING → HANDSHAKING → CONNECTED.
      */
     private class MessageReceiverThread extends Thread {
         private final BluetoothSocket socket;
@@ -2129,32 +2366,41 @@ public class MeshManager {
             String mac = "";
             try {
                 mac = socket.getRemoteDevice().getAddress();
+                int rssi = rssiValues.getOrDefault(mac, 0);
+                fireProgress(mac, mac, ConnectionPhase.TRANSPORT_CONNECTING, "bluetooth", rssi);
 
-                // Output stream first (writes header), then flush, then input stream
-                ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
-                out.flush();
+                BufferedWriter out = new BufferedWriter(
+                        new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8));
+                BufferedReader in = new BufferedReader(
+                        new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
+
                 bluetoothOutputStreams.put(mac, out);
 
-                ObjectInputStream in = new ObjectInputStream(socket.getInputStream());
-
-                // Send our handshake immediately after streams are ready
+                // Send our identity immediately — the peer will do the same
+                fireProgress(mac, mac, ConnectionPhase.HANDSHAKING, "bluetooth", rssi);
                 sendHandshake(out);
 
                 notifyNodeConnected(mac);
 
-                // Read loop — blocks until a message arrives or connection drops
-                while (!isInterrupted()) {
-                    Object received = in.readObject();
-                    if (received instanceof Message) {
-                        handleIncomingMessage((Message) received, mac);
+                // Read loop — blocks until a full JSON line arrives or socket closes
+                String line;
+                while (!isInterrupted() && (line = in.readLine()) != null) {
+                    try {
+                        Message received = gson.fromJson(line, Message.class);
+                        if (received != null) {
+                            handleIncomingMessage(received, mac);
+                        }
+                    } catch (Exception parseEx) {
+                        Log.w(TAG, "JSON parse error from " + mac + ": " + parseEx.getMessage());
                     }
                 }
             } catch (IOException e) {
-                Log.d(TAG, "Connection lost: " + mac);
-            } catch (ClassNotFoundException e) {
-                Log.e(TAG, "Unknown object from: " + mac);
+                Log.d(TAG, "BT connection lost: " + mac);
             } finally {
-                if (!mac.isEmpty()) notifyNodeDisconnected(mac);
+                if (!mac.isEmpty()) {
+                    fireProgress(mac, mac, ConnectionPhase.FAILED, "bluetooth", 0);
+                    notifyNodeDisconnected(mac);
+                }
             }
         }
     }
@@ -2252,8 +2498,8 @@ public class MeshManager {
      * Manages bidirectional messaging on an established WiFi Direct TCP socket.
      *
      * Works identically to the Bluetooth MessageReceiverThread:
-     *   1. Creates ObjectOutputStream (flush header first to avoid deadlock).
-     *   2. Creates ObjectInputStream.
+     *   1. Creates a BufferedWriter (UTF-8 JSON, one message per line).
+     *   2. Creates a BufferedReader to receive JSON lines from the peer.
      *   3. Sends our handshake (username + UUID + FCM token).
      *   4. Enters a read loop, dispatching incoming messages to
      *      handleIncomingMessage() with the peer's IP as sourceAddress.
@@ -2262,6 +2508,15 @@ public class MeshManager {
      * it relays the message to ALL other connected nodes (excluding the source)
      * via sendToAllPeers(). This is how the GO bridges WiFi Direct peers that
      * cannot talk directly to each other.
+     */
+    /**
+     * Manages bidirectional messaging on an established WiFi Direct TCP socket.
+     *
+     * Wire format: UTF-8 JSON, one Message object per line — same as
+     * {@link MessageReceiverThread} for Bluetooth, keeping both transports
+     * consistent and eliminating Java deserialization as an attack surface.
+     *
+     * Progress events emitted: TRANSPORT_CONNECTING → HANDSHAKING → CONNECTED.
      */
     private class WifiDirectReceiverThread extends Thread {
         private final Socket socket;
@@ -2275,35 +2530,40 @@ public class MeshManager {
 
         @Override
         public void run() {
+            fireProgress(peerAddress, peerAddress,
+                    ConnectionPhase.TRANSPORT_CONNECTING, "wifi_direct", 0);
             try {
-                // Output stream MUST be created and flushed before input stream
-                // to prevent deadlock (same as Bluetooth — both sides write their
-                // stream header first, then read).
-                ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
-                out.flush();
+                BufferedWriter out = new BufferedWriter(
+                        new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8));
+                BufferedReader in = new BufferedReader(
+                        new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
+
                 wifiDirectOutputStreams.put(peerAddress, out);
 
-                ObjectInputStream in = new ObjectInputStream(socket.getInputStream());
-
-                // Send handshake immediately
+                fireProgress(peerAddress, peerAddress,
+                        ConnectionPhase.HANDSHAKING, "wifi_direct", 0);
                 sendHandshake(out);
 
-                // Mark this peer as connected
                 wifiDirectConnectedNodes.add(peerAddress);
                 notifyNodeConnected(peerAddress);
 
-                // Read loop — blocks until data or disconnection
-                while (!isInterrupted()) {
-                    Object received = in.readObject();
-                    if (received instanceof Message) {
-                        handleIncomingMessage((Message) received, peerAddress);
+                String line;
+                while (!isInterrupted() && (line = in.readLine()) != null) {
+                    try {
+                        Message received = gson.fromJson(line, Message.class);
+                        if (received != null) {
+                            handleIncomingMessage(received, peerAddress);
+                        }
+                    } catch (Exception parseEx) {
+                        Log.w(TAG, "JSON parse error from WD peer " + peerAddress
+                                + ": " + parseEx.getMessage());
                     }
                 }
             } catch (IOException e) {
                 Log.d(TAG, "WiFi Direct connection lost: " + peerAddress);
-            } catch (ClassNotFoundException e) {
-                Log.e(TAG, "Unknown object from WiFi Direct peer: " + peerAddress);
             } finally {
+                fireProgress(peerAddress, peerAddress,
+                        ConnectionPhase.FAILED, "wifi_direct", 0);
                 notifyNodeDisconnected(peerAddress);
             }
         }

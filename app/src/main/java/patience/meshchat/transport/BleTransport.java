@@ -76,13 +76,17 @@ public class BleTransport implements MeshTransport {
 
     private static final String TAG = "BleTransport";
 
-    /** Custom GATT service UUID for MeshChat messaging */
+    /**
+     * GATT service UUID — distinct from the BleAdvertiser discovery UUID so
+     * the GATT scanner only matches connectable GATT servers, never the
+     * non-connectable beacons emitted by BleAdvertiser.
+     */
     private static final UUID SERVICE_UUID =
-            UUID.fromString("d7e5f010-bead-4e9a-b9f5-0c6a8e3f1b2c");
+            UUID.fromString("d7e5f020-bead-4e9a-b9f5-0c6a8e3f1b2c");
 
     /** Writable characteristic for sending message data */
     private static final UUID CHARACTERISTIC_UUID =
-            UUID.fromString("d7e5f011-bead-4e9a-b9f5-0c6a8e3f1b2c");
+            UUID.fromString("d7e5f021-bead-4e9a-b9f5-0c6a8e3f1b2c");
 
     private static final ParcelUuid SERVICE_PARCEL_UUID = new ParcelUuid(SERVICE_UUID);
 
@@ -103,6 +107,14 @@ public class BleTransport implements MeshTransport {
 
     /** Active GATT client connections to peers */
     private final Map<String, BluetoothGatt> gattClients = new ConcurrentHashMap<>();
+
+    /**
+     * Negotiated MTU per peer (after onMtuChanged). BLE ATT payload = MTU - 3.
+     * Default 23 bytes (MTU 20 payload) until negotiation completes.
+     */
+    private final Map<String, Integer> gattMtu = new ConcurrentHashMap<>();
+    private static final int DEFAULT_MTU_PAYLOAD = 20;
+    private static final int REQUEST_MTU = 512;
 
     /** De-duplication: suppress repeated discoveries within 30s */
     private final Map<String, Long> recentDiscoveries = new ConcurrentHashMap<>();
@@ -134,14 +146,23 @@ public class BleTransport implements MeshTransport {
     public boolean send(String peerId, byte[] data) {
         BluetoothGatt gatt = gattClients.get(peerId);
         if (gatt == null) {
-            // Attempt to connect first, then send
+            // No existing connection — pre-warm in background but return false so
+            // CompositeTransport can fall through to the next available transport.
             connectAndSend(peerId, data);
-            return true; // optimistic — data will be sent on connect
+            return false;
         }
-        return writeCharacteristic(gatt, data);
+        return writeChunked(gatt, peerId, data);
     }
 
-    private boolean writeCharacteristic(BluetoothGatt gatt, byte[] data) {
+    /**
+     * Writes {@code data} to the peer's writable GATT characteristic, chunking
+     * it into MTU-sized pieces if necessary.
+     *
+     * BLE ATT payload = negotiated MTU - 3 bytes (ATT header overhead).
+     * Default before MTU negotiation is 20 bytes.  After requestMtu(512),
+     * most modern phones negotiate ~512 bytes, allowing larger payloads.
+     */
+    private boolean writeChunked(BluetoothGatt gatt, String peerId, byte[] data) {
         try {
             BluetoothGattService service = gatt.getService(SERVICE_UUID);
             if (service == null) return false;
@@ -150,8 +171,23 @@ public class BleTransport implements MeshTransport {
                     service.getCharacteristic(CHARACTERISTIC_UUID);
             if (characteristic == null) return false;
 
-            characteristic.setValue(data);
-            return gatt.writeCharacteristic(characteristic);
+            int payload = gattMtu.getOrDefault(peerId, DEFAULT_MTU_PAYLOAD);
+            if (data.length <= payload) {
+                characteristic.setValue(data);
+                return gatt.writeCharacteristic(characteristic);
+            }
+
+            // Chunk: write sequentially; BLE is synchronous per-connection
+            int offset = 0;
+            while (offset < data.length) {
+                int end = Math.min(offset + payload, data.length);
+                byte[] chunk = new byte[end - offset];
+                System.arraycopy(data, offset, chunk, 0, chunk.length);
+                characteristic.setValue(chunk);
+                if (!gatt.writeCharacteristic(characteristic)) return false;
+                offset = end;
+            }
+            return true;
         } catch (SecurityException e) {
             Log.w(TAG, "GATT write permission denied: " + e.getMessage());
             return false;
@@ -171,12 +207,11 @@ public class BleTransport implements MeshTransport {
                     try {
                         if (newState == BluetoothProfile.STATE_CONNECTED) {
                             gattClients.put(peerId, gatt);
-                            gatt.discoverServices();
-                            if (transportCallback != null) {
-                                transportCallback.onPeerConnected(peerId, getName());
-                            }
+                            // Request a larger MTU before service discovery
+                            gatt.requestMtu(REQUEST_MTU);
                         } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                             gattClients.remove(peerId);
+                            gattMtu.remove(peerId);
                             gatt.close();
                             if (transportCallback != null) {
                                 transportCallback.onPeerDisconnected(peerId, getName());
@@ -188,9 +223,26 @@ public class BleTransport implements MeshTransport {
                 }
 
                 @Override
+                public void onMtuChanged(BluetoothGatt gatt, int mtu, int status) {
+                    // Store negotiated payload size (MTU - 3 bytes ATT overhead)
+                    int payload = (status == BluetoothGatt.GATT_SUCCESS) ? mtu - 3
+                            : DEFAULT_MTU_PAYLOAD;
+                    gattMtu.put(peerId, payload);
+                    try {
+                        // Proceed to service discovery after MTU is negotiated
+                        gatt.discoverServices();
+                        if (transportCallback != null) {
+                            transportCallback.onPeerConnected(peerId, getName());
+                        }
+                    } catch (SecurityException e) {
+                        Log.w(TAG, "GATT discoverServices denied: " + e.getMessage());
+                    }
+                }
+
+                @Override
                 public void onServicesDiscovered(BluetoothGatt gatt, int status) {
                     if (status == BluetoothGatt.GATT_SUCCESS) {
-                        writeCharacteristic(gatt, data);
+                        writeChunked(gatt, peerId, data);
                     }
                 }
             });

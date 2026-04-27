@@ -1,0 +1,249 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Connection Progress Dialog
+  Shows the live stages of peer connection:
+    Scanning → Detected → Connecting → Handshaking → Connected
+-->
+<LinearLayout
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:paddingStart="24dp"
+    android:paddingEnd="24dp"
+    android:paddingTop="20dp"
+    android:paddingBottom="8dp">
+
+    <!-- Network name header -->
+    <TextView
+        android:id="@+id/tvProgressTitle"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:textSize="18sp"
+        android:textStyle="bold"
+        android:textColor="@color/textPrimary"
+        android:text="Connecting…"
+        android:gravity="center"
+        android:layout_marginBottom="20dp"/>
+
+    <!-- ═══ 5-step horizontal stepper ═══ -->
+    <!-- Each step: icon dot + label below it, connected by a line -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:layout_marginBottom="20dp">
+
+        <!-- Step 1: Scan -->
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:orientation="vertical"
+            android:gravity="center">
+            <View
+                android:id="@+id/dotScan"
+                android:layout_width="16dp"
+                android:layout_height="16dp"
+                android:background="@drawable/shape_step_dot"/>
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Scan"
+                android:textSize="10sp"
+                android:layout_marginTop="4dp"
+                android:textColor="@color/textSecondary"/>
+        </LinearLayout>
+
+        <!-- Connector line 1→2 -->
+        <View
+            android:id="@+id/lineScanDetect"
+            android:layout_width="0dp"
+            android:layout_height="2dp"
+            android:layout_weight="0.5"
+            android:background="@color/statusOffline"/>
+
+        <!-- Step 2: Detect -->
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:orientation="vertical"
+            android:gravity="center">
+            <View
+                android:id="@+id/dotDetect"
+                android:layout_width="16dp"
+                android:layout_height="16dp"
+                android:background="@drawable/shape_step_dot"/>
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Detect"
+                android:textSize="10sp"
+                android:layout_marginTop="4dp"
+                android:textColor="@color/textSecondary"/>
+        </LinearLayout>
+
+        <!-- Connector line 2→3 -->
+        <View
+            android:id="@+id/lineDetectConnect"
+            android:layout_width="0dp"
+            android:layout_height="2dp"
+            android:layout_weight="0.5"
+            android:background="@color/statusOffline"/>
+
+        <!-- Step 3: Connect -->
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:orientation="vertical"
+            android:gravity="center">
+            <View
+                android:id="@+id/dotConnect"
+                android:layout_width="16dp"
+                android:layout_height="16dp"
+                android:background="@drawable/shape_step_dot"/>
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Link"
+                android:textSize="10sp"
+                android:layout_marginTop="4dp"
+                android:textColor="@color/textSecondary"/>
+        </LinearLayout>
+
+        <!-- Connector line 3→4 -->
+        <View
+            android:id="@+id/lineConnectHandshake"
+            android:layout_width="0dp"
+            android:layout_height="2dp"
+            android:layout_weight="0.5"
+            android:background="@color/statusOffline"/>
+
+        <!-- Step 4: Handshake -->
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:orientation="vertical"
+            android:gravity="center">
+            <View
+                android:id="@+id/dotHandshake"
+                android:layout_width="16dp"
+                android:layout_height="16dp"
+                android:background="@drawable/shape_step_dot"/>
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Auth"
+                android:textSize="10sp"
+                android:layout_marginTop="4dp"
+                android:textColor="@color/textSecondary"/>
+        </LinearLayout>
+
+        <!-- Connector line 4→5 -->
+        <View
+            android:id="@+id/lineHandshakeDone"
+            android:layout_width="0dp"
+            android:layout_height="2dp"
+            android:layout_weight="0.5"
+            android:background="@color/statusOffline"/>
+
+        <!-- Step 5: Connected -->
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:orientation="vertical"
+            android:gravity="center">
+            <View
+                android:id="@+id/dotDone"
+                android:layout_width="16dp"
+                android:layout_height="16dp"
+                android:background="@drawable/shape_step_dot"/>
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Done"
+                android:textSize="10sp"
+                android:layout_marginTop="4dp"
+                android:textColor="@color/textSecondary"/>
+        </LinearLayout>
+
+    </LinearLayout>
+
+    <!-- Peer info row (hidden until PEER_DETECTED) -->
+    <LinearLayout
+        android:id="@+id/peerInfoRow"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:padding="12dp"
+        android:background="@color/surfaceBackground"
+        android:layout_marginBottom="16dp"
+        android:visibility="gone">
+
+        <TextView
+            android:id="@+id/tvPeerName"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:textSize="14sp"
+            android:textColor="@color/textSecondary"
+            android:text=""/>
+
+        <TextView
+            android:id="@+id/tvTransportBadge"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:padding="4dp"
+            android:textSize="11sp"
+            android:textColor="@color/colorPrimary"
+            android:text=""/>
+
+        <!-- RSSI signal bars (3 small views) -->
+        <LinearLayout
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="bottom"
+            android:layout_marginStart="8dp">
+            <View android:id="@+id/rssiBar1"
+                android:layout_width="4dp" android:layout_height="6dp"
+                android:layout_marginEnd="2dp"
+                android:background="@color/colorPrimary"/>
+            <View android:id="@+id/rssiBar2"
+                android:layout_width="4dp" android:layout_height="10dp"
+                android:layout_marginEnd="2dp"
+                android:background="@color/colorPrimary"/>
+            <View android:id="@+id/rssiBar3"
+                android:layout_width="4dp" android:layout_height="14dp"
+                android:background="@color/statusOffline"/>
+        </LinearLayout>
+
+    </LinearLayout>
+
+    <!-- Animated status text -->
+    <TextView
+        android:id="@+id/tvProgressStatus"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center"
+        android:textSize="13sp"
+        android:textColor="@color/textSecondary"
+        android:text="Starting scan…"
+        android:layout_marginBottom="8dp"/>
+
+    <!-- Indeterminate progress bar -->
+    <ProgressBar
+        android:id="@+id/progressBarConn"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:indeterminate="true"
+        android:layout_marginBottom="8dp"/>
+
+</LinearLayout>

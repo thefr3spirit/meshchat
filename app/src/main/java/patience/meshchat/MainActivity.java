@@ -59,6 +59,10 @@ public class MainActivity extends AppCompatActivity {
     private ConnectivityObserver connectivityObserver;
     private TextView connectivityBanner;
     private final Handler bannerHandler = new Handler(Looper.getMainLooper());
+
+    // ─── Mesh status chip ────────────────────────────────────────────────
+    /** Persistent chip showing live peer count and connection state. */
+    private TextView meshStatusChip;
     /** Null until the first callback fires — used to detect the "back online" transition. */
     private ConnectivityObserver.NetworkState lastKnownNetworkState = null;
 
@@ -131,6 +135,7 @@ public class MainActivity extends AppCompatActivity {
         });
 
         connectivityBanner = findViewById(R.id.connectivityBanner);
+        meshStatusChip     = findViewById(R.id.meshStatusChip);
         connectivityObserver = new ConnectivityObserver(this, new ConnectivityObserver.Listener() {
             @Override
             public void onNetworkStateChanged(ConnectivityObserver.NetworkState state,
@@ -305,6 +310,7 @@ public class MainActivity extends AppCompatActivity {
      */
     public void showDiscoveryScreen() {
         bottomNav.setVisibility(android.view.View.GONE);
+        if (meshStatusChip != null) meshStatusChip.setVisibility(View.GONE);
         // Pop any chat screens
         getSupportFragmentManager().popBackStack(null,
                 androidx.fragment.app.FragmentManager.POP_BACK_STACK_INCLUSIVE);
@@ -338,6 +344,9 @@ public class MainActivity extends AppCompatActivity {
         }
 
         bottomNav.setVisibility(android.view.View.VISIBLE);
+        meshStatusChip.setVisibility(View.VISIBLE);
+        updateMeshStatusChip(0, true);
+
         getSupportFragmentManager().beginTransaction()
                 .hide(peersListFragment)
                 .hide(topologyFragment)
@@ -349,6 +358,19 @@ public class MainActivity extends AppCompatActivity {
 
         // Register mesh listener on the main tabs
         registerGlobalMeshListener();
+    }
+
+    /** Updates the persistent mesh status chip text. */
+    private void updateMeshStatusChip(int peerCount, boolean connecting) {
+        if (meshStatusChip == null) return;
+        if (connecting && peerCount == 0) {
+            meshStatusChip.setText("Mesh: scanning for peers...");
+        } else if (peerCount == 0) {
+            meshStatusChip.setText("Mesh: no peers connected");
+        } else {
+            meshStatusChip.setText("Mesh: " + peerCount
+                    + (peerCount == 1 ? " peer connected" : " peers connected"));
+        }
     }
 
     /**
@@ -480,7 +502,10 @@ public class MainActivity extends AppCompatActivity {
             }
 
             @Override
-            public void onNodeInfoUpdated(List<NodeInfo> nodes) {}
+            public void onNodeInfoUpdated(List<NodeInfo> nodes) {
+                // Update the persistent mesh status chip on the main thread
+                runOnUiThread(() -> updateMeshStatusChip(nodes.size(), false));
+            }
 
             @Override
             public void onNetworkDiscovered(List<Network> networks) {}
